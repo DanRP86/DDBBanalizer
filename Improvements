@@ -1,0 +1,25 @@
+# ADD: helper para elegir hoja más "densa"
+def select_excel_sheet_with_most_data(xlsx_path: Path, max_rows_sample: int = 5000) -> str:
+    xl = pd.ExcelFile(xlsx_path)
+    best_sheet, best_score = None, -1
+    for sheet in xl.sheet_names:
+        try:
+            # muestreo para rendimiento
+            df_tmp = xl.parse(sheet, nrows=max_rows_sample)
+            # puntuación = celdas no nulas totales
+            score = int(df_tmp.notna().sum().sum())
+            if score > best_score:
+                best_score, best_sheet = score, sheet
+        except Exception:
+            continue
+    return best_sheet or xl.sheet_names[0]
+
+def smart_read_any(path: Path, forced_encoding: Optional[str] = None, forced_sep: Optional[str] = None,
+                   input_sheet: Optional[str] = None) -> Tuple[pd.DataFrame, dict]:
+    suffix = path.suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        # Usa la hoja forzada, o selecciona la de mayor densidad
+        sheet = input_sheet or select_excel_sheet_with_most_data(path)
+        df = pd.read_excel(path, sheet_name=sheet)
+        return df, {"encoding": "binary", "sep": f"excel:{sheet}", "forced": False, "sheet": sheet}
+    return smart_read_csv_with_guess(path, forced_encoding, forced_sep)
