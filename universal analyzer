@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Universal CSV Analyzer (V0.2) robust + File Picker (Tkinter) + Criticality + Cell Coloring
+
+Features:
+- File picker if --input not provided (CSV/TSV/Excel).
+- Robust reading: encoding detection (BOM, optional chardet), separator detection (csv.Sniffer + heuristics).
+- CLI flags to force --encoding and --sep (tab, comma, semicolon, pipe or symbol).
+- Type inference per column: numeric, percent, date, email, url, id_like, categorical, free_text.
+- Checks: missing, duplicates (detection), outliers (IQR), magnitude outliers, percent range, date bounds,
+  category coherence (95% coverage), free text anomalies (length IQR, weird symbols with robust MAD).
+- Criticality mapping per issue (LOW, MEDIUM, HIGH, VERY_HIGH).
+- Excel output (English sheets): Summary, Inferred_Types, Missing, Issues, Duplicates, Dataset.
+- Cell coloring in Dataset by highest criticality affecting each cell.
+- Inferred_Types includes has_issues and worst_criticality.
+
+Requirements:
+    pip install pandas numpy openpyxl
+Optional:
+    pip install chardet
+"""
+
+import argparse
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Tuple, Dict, List
+import re
+import numpy as np
+import pandas as pd
+import csv
+
+# =======================
+#  File Picker (Tkinter)
+# =======================
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
+
+DEFAULT_DIR = Path.cwd()
+
+def pick_file_dialog() -> Optional[Path]:
+    """Open file dialog to pick CSV/TSV/Excel. Returns Path or None."""
+    if not TK_AVAILABLE:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    selected = filedialog.askopenfilename(
+        initialdir=str(DEFAULT_DIR),
+        title="Select data file",
+        filetypes=[
+            ("CSV/TSV", "*.csv *.tsv *.txt"),
+            ("Excel", "*.xlsx *.xls"),
+            ("All", "*.*"),
+        ],
+    )
+    root.destroy()
+    return Path(selected) if selected else None
+
+# =======================
+#  Robust reading
+# =======================
+SEP_ALIASES = {
+    "tab": "\t",
+    "comma": ",",
+    "semicolon": ";",
+    "pipe": "|",
+}
+
+def normalize_sep_arg(sep_arg: Optional[str]) -> Optional[str]:
+    if not sep_arg:
+        return None
+    s = sep_arg.strip().lower()
+    return SEP_ALIASES.get(s, sep_arg)
+
+def detect_bom_encoding(raw: bytes) -> Optional[str]:
+    if raw.startswith(b"\xff\xfe\x00\x00"):
+        return "utf-32le"
+    if raw.startswith(b"\x00\x00\xfe\xff"):
+        return "utf-32be"
+    if raw.startswith(b"\xff\xfe"):
+        return "utf-16le"
+    if raw.startswith(b"\xfe\xff"):
+        return "utf-16be"
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    return None
+
+def try_chardet(raw: bytes) -> Optional[str]:
+    try:
+        import chardet  # type: ignore
+        guess = chardet.detect(raw)
+        return guess.get("encoding")
+    except Exception:
+        return None
+
+def detect_separator(text: str, max_lines: int = 50) -> Optional[str]:
+    lines = [ln for ln in text.splitlines() if ln.strip()][:max_lines]
+    if not lines:
+        return None
+    sample = "\n".join(lines)
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
+        return dialect.delimiter
+    except Exception:
+        pass
+    # heuristic
+    candidates = [",", ";", "\t", "|"]
+    best_sep, best_score = None, -1e9
+    for sep in candidates:
+        counts = [ln.count(sep) for ln in lines]
+        mean_c = float(np.mean(counts))
+        var_c = float(np.var(counts))
+        score = mean_c - var_c
+        if mean_c >= 1 and score > best_score:
+            best_sep, best_score = sep, score
+    return best_sep
+
+def smart_read_csv_with_guess(path: Path, forced_encoding: Optional[str] = None, forced_sep: Optional[str] = None)\
+        -> Tuple[pd.DataFrame, dict]:
+    # forced path
+    if forced_encoding or forced_sep:
+        enc = forced_encoding or "utf-8"
+        sep = normalize_sep_arg(forced_sep) or None
+        if sep is None:
+            with open(path, "rb") as f:
+                raw = f.read(200_000)
+            text = raw.decode(enc, errors="replace")
+            sep = detect_separator(text) or ","
+        df = pd.read_csv(path, sep=sep, encoding=enc, engine="python")
+        return df, {"encoding": enc, "sep": sep, "forced": True}
+
+    # auto
+    with open(path, "rb") as f:
+        raw = f.read(200_000)
+    encodings_to_try = []
+    bom_enc = detect_bom_encoding(raw)
+    if bom_enc:
+        encodings_to_try.append(bom_enc)
+    encodings_to_try += ["utf-8", "utf-8-sig", "latin1", "cp1252", "utf-16", "utf-16le", "utf-16be", "utf-32"]
+    chardet_enc = try_chardet(raw)
+    if chardet_enc and chardet_enc not in encodings_to_try:
+        encodings_to_try.append(chardet_enc)
+
+    last_err = None
+    for enc in encodings_to_try:
+        try:
+            text = raw.decode(enc, errors="replace")
+        except Exception as e:
+            last_err = e
+            continue
+        sep = detect_separator(text) or None
+        try:
+            if sep:
+                df = pd.read_csv(path, sep=sep, encoding=enc, engine="python")
+                return df, {"encoding": enc, "sep": sep, "forced": False}
+            else:
+                df = pd.read_csv(path, sep=None, encoding=enc, engine="python")
+                return df, {"encoding": enc, "sep": "auto", "forced": False}
+        except Exception as e:
+            last_err = e
+            for sep_try in [",", ";", "\t", "|"]:
+                try:
+                    df = pd.read_csv(path, sep=sep_try, encoding=enc, engine="python")
+                    return df, {"encoding": enc, "sep": sep_try, "forced": False}
+                except Exception as e2:
+                    last_err = e2
+    raise ValueError(f"Could not read CSV after multiple attempts. Last error: {last_err}")
+
+def smart_read_any(path: Path, forced_encoding: Optional[str] = None, forced_sep: Optional[str] = None)\
+        -> Tuple[pd.DataFrame, dict]:
+    suffix = path.suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        df = pd.read_excel(path)
+        return df, {"encoding": "binary", "sep": "excel", "forced": False}
+    return smart_read_csv_with_guess(path, forced_encoding, forced_sep)
+
+# =======================
+#  Type inference & checks
+# =======================
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+ALNUM_RE = re.compile(r"^[A-Za-z0-9\-_]+$")
+
+def infer_kind(s: pd.Series, sample_size: int = 500) -> dict:
+    s_non_null = s.dropna()
+    if len(s_non_null) == 0:
+        return {"kind": "empty", "details": {}}
+
+    sample = s_non_null.sample(min(sample_size, len(s_non_null)), random_state=42)
+    sample_str = sample.astype(str).str.strip()
+
+    email_ratio = sample_str.str.fullmatch(EMAIL_RE).mean()
+    url_ratio = sample_str.str.startswith(("http://", "https://")).mean()
+    parsed_dates = pd.to_datetime(sample_str, errors="coerce", dayfirst=True)
+    date_ratio = parsed_dates.notna().mean()
+
+    has_percent_symbol = sample_str.str.contains("%").mean() > 0.05
+    parsed_num = pd.to_numeric(sample_str.str.replace("%", "", regex=False), errors="coerce")
+    num_ratio = parsed_num.notna().mean()
+
+    nunique = s_non_null.nunique(dropna=True)
+    uniq_ratio = nunique / len(s_non_null)
+    avg_len = sample_str.str.len().mean()
+
+    if email_ratio > 0.6:
+        return {"kind": "email", "details": {"email_ratio": email_ratio}}
+    if url_ratio > 0.6:
+        return {"kind": "url", "details": {"url_ratio": url_ratio}}
+    if date_ratio > 0.7:
+        return {"kind": "date", "details": {"date_parse_ratio": date_ratio}}
+    if num_ratio > 0.7:
+        inside_0_1 = ((parsed_num >= 0) & (parsed_num <= 1)).mean()
+        inside_0_100 = ((parsed_num >= 0) & (parsed_num <= 100)).mean()
+        if has_percent_symbol or max(inside_0_1, inside_0_100) > 0.85:
+            scale = "0_1" if inside_0_1 >= inside_0_100 else "0_100"
+            return {"kind": "percent", "details": {"scale": scale}}
+        else:
+            return {"kind": "numeric", "details": {}}
+    if uniq_ratio > 0.9 and avg_len <= 40 and sample_str.str.fullmatch(ALNUM_RE).mean() > 0.7:
+        return {"kind": "id_like", "details": {"uniq_ratio": uniq_ratio, "avg_len": avg_len}}
+    if uniq_ratio < 0.2 and avg_len < 30:
+        return {"kind": "categorical", "details": {"uniq_ratio": uniq_ratio, "avg_len": avg_len, "nunique": int(nunique)}}
+    return {"kind": "free_text", "details": {"uniq_ratio": uniq_ratio, "avg_len": avg_len, "nunique": int(nunique)}}
+
+def iqr_outliers(x: pd.Series, k: float = 1.5) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    q1 = x.quantile(0.25)
+    q3 = x.quantile(0.75)
+    iqr = q3 - q1
+    if pd.isna(iqr) or iqr == 0:
+        return pd.Series(False, index=x.index)
+    lower = q1 - k * iqr
+    upper = q3 + k * iqr
+    return (x < lower) | (x > upper)
+
+def magnitude_outliers(x: pd.Series, factor: float = 1e3) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    med = x.median()
+    if pd.isna(med) or med == 0:
+        return pd.Series(False, index=x.index)
+    return x > (abs(med) * factor)
+
+# =======================
+#  Criticality mapping
+# =======================
+CRIT_ORDER = ["LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
+CRIT_TO_NUM = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "VERY_HIGH": 4}
+NUM_TO_CRIT = {v: k for k, v in CRIT_TO_NUM.items()}
+
+ISSUE_CRITICALITY = {
+    "numeric_parse_fail": "HIGH",
+    "outlier_iqr": "MEDIUM",
+    "outlier_magnitude": "HIGH",
+    "percent_parse_fail": "HIGH",
+    "percent_out_of_range": "HIGH",
+    "percent_outlier_iqr": "MEDIUM",
+    "date_parse_fail": "HIGH",
+    "date_out_of_bounds": "VERY_HIGH",
+    "email_format": "HIGH",
+    "url_format": "MEDIUM",
+    "rare_category": "LOW",
+    "text_length_outlier": "LOW",
+    "weird_symbols_ratio": "MEDIUM",
+    # future rules (not implemented yet):
+    # "required": "HIGH",
+    # "unique_violation": "HIGH",
+    # "freshness_violation": "HIGH",
+}
+
+def crit_num(issue_code: str) -> int:
+    label = ISSUE_CRITICALITY.get(issue_code, "LOW")
+    return CRIT_TO_NUM[label]
+
+# =======================
+#  Column-level checks (aggregate issues)
+# =======================
+def check_numeric(s: pd.Series) -> List[dict]:
+    issues = []
+    parsed = pd.to_numeric(s, errors="coerce")
+    parse_fail = s.notna() & parsed.isna()
+    if parse_fail.any():
+        issues.append({
+            "column": s.name, "issue": "numeric_parse_fail",
+            "criticality": ISSUE_CRITICALITY["numeric_parse_fail"],
+            "rows": int(parse_fail.sum()),
+            "sample": s[parse_fail].astype(str).head(5).tolist(),
+            "details": {}
+        })
+    mask_iqr = iqr_outliers(parsed, k=1.5)
+    if mask_iqr.any():
+        issues.append({
+            "column": s.name, "issue": "outlier_iqr",
+            "criticality": ISSUE_CRITICALITY["outlier_iqr"],
+            "rows": int(mask_iqr.sum()),
+            "sample": s[mask_iqr].astype(str).head(5).tolist(),
+            "details": {}
+        })
+    mask_mag = magnitude_outliers(parsed, factor=1e3)
+    if mask_mag.any():
+        issues.append({
+            "column": s.name, "issue": "outlier_magnitude",
+            "criticality": ISSUE_CRITICALITY["outlier_magnitude"],
+            "rows": int(mask_mag.sum()),
+            "sample": s[mask_mag].astype(str).head(5).tolist(),
+            "details": {"factor": 1e3}
+        })
+    return issues
+
+def check_percent(s: pd.Series, scale: str) -> List[dict]:
+    issues = []
+    s_stripped = s.astype(str).str.replace("%", "", regex=False)
+    x = pd.to_numeric(s_stripped, errors="coerce")
+    parse_fail = s.notna() & x.isna()
+    if parse_fail.any():
+        issues.append({
+            "column": s.name, "issue": "percent_parse_fail",
+            "criticality": ISSUE_CRITICALITY["percent_parse_fail"],
+            "rows": int(parse_fail.sum()),
+            "sample": s[parse_fail].astype(str).head(5).tolist(),
+            "details": {}
+        })
+    if scale == "0_1":
+        bad = (x < 0) | (x > 1.001)
+        scale_info = "[0,1]"
+    else:
+        bad = (x < 0) | (x > 100.001)
+        scale_info = "[0,100]"
+    if bad.any():
+        issues.append({
+            "column": s.name, "issue": "percent_out_of_range",
+            "criticality": ISSUE_CRITICALITY["percent_out_of_range"],
+            "rows": int(bad.sum()),
+            "sample": s[bad].astype(str).head(5).tolist(),
+            "details": {"expected": scale_info}
+        })
+    mask_iqr = iqr_outliers(x, k=1.5)
+    if mask_iqr.any():
+        issues.append({
+            "column": s.name, "issue": "percent_outlier_iqr",
+            "criticality": ISSUE_CRITICALITY["percent_outlier_iqr"],
+            "rows": int(mask_iqr.sum()),
+            "sample": s[mask_iqr].astype(str).head(5).tolist(),
+            "details": {"scale": scale_info}
+        })
+    return issues
+
+def check_date(s: pd.Series, future_days: int) -> List[dict]:
+    issues = []
+    x = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    parse_fail = s.notna() & x.isna()
+    if parse_fail.any():
+        issues.append({
+            "column": s.name, "issue": "date_parse_fail",
+            "criticality": ISSUE_CRITICALITY["date_parse_fail"],
+            "rows": int(parse_fail.sum()),
+            "sample": s[parse_fail].astype(str).head(5).tolist(),
+            "details": {}
+        })
+    if x.notna().any():
+        too_old = x < pd.Timestamp(year=1900, month=1, day=1)
+        too_new = x > (pd.Timestamp.today() + pd.Timedelta(days=future_days))
+        bad = (too_old | too_new) & x.notna()
+        if bad.any():
+            issues.append({
+                "column": s.name, "issue": "date_out_of_bounds",
+                "criticality": ISSUE_CRITICALITY["date_out_of_bounds"],
+                "rows": int(bad.sum()),
+                "sample": s[bad].astype(str).head(5).tolist(),
+                "details": {"min": "1900-01-01", "max": f"today+{future_days}d"}
+            })
+    return issues
+
+def check_email(s: pd.Series) -> List[dict]:
+    mask_bad = s.notna() & ~s.astype(str).str.fullmatch(EMAIL_RE)
+    if mask_bad.any():
+        return [{
+            "column": s.name, "issue": "email_format",
+            "criticality": ISSUE_CRITICALITY["email_format"],
+            "rows": int(mask_bad.sum()),
+            "sample": s[mask_bad].astype(str).head(5).tolist(),
+            "details": {}
+        }]
+    return []
+
+def check_url(s: pd.Series) -> List[dict]:
+    mask_bad = s.notna() & ~s.astype(str).str.startswith(("http://", "https://"))
+    if mask_bad.any():
+        return [{
+            "column": s.name, "issue": "url_format",
+            "criticality": ISSUE_CRITICALITY["url_format"],
+            "rows": int(mask_bad.sum()),
+            "sample": s[mask_bad].astype(str).head(5).tolist(),
+            "details": {}
+        }]
+    return []
+
+def check_categorical_coherence(s: pd.Series, coverage_target: float = 0.95, max_top: int = 20) -> List[dict]:
+    s_non_null = s.dropna()
+    if len(s_non_null) == 0:
+        return []
+    vc = s_non_null.value_counts(dropna=False)
+    cum_cov = 0.0
+    allowed = set()
+    for val, cnt in vc.items():
+        allowed.add(val)
+        cum_cov += cnt / len(s_non_null)
+        if cum_cov >= coverage_target or len(allowed) >= max_top:
+            break
+    mask_rare = s.notna() & ~s.isin(list(allowed))
+    if mask_rare.any():
+        return [{
+            "column": s.name, "issue": "rare_category",
+            "criticality": ISSUE_CRITICALITY["rare_category"],
+            "rows": int(mask_rare.sum()),
+            "sample": s[mask_rare].astype(str).head(5).tolist(),
+            "details": {"coverage_target": coverage_target, "allowed_count": len(allowed)}
+        }]
+    return []
+
+def check_free_text_anomalies(s: pd.Series) -> List[dict]:
+    issues = []
+    s_str = s.dropna().astype(str)
+    if len(s_str) == 0:
+        return issues
+    lens = s_str.str.len()
+    mask_len = iqr_outliers(lens, k=2.0)
+    if mask_len.any():
+        issues.append({
+            "column": s.name, "issue": "text_length_outlier",
+            "criticality": ISSUE_CRITICALITY["text_length_outlier"],
+            "rows": int(mask_len.sum()),
+            "sample": s_str[mask_len].head(5).tolist(),
+            "details": {}
+        })
+    sym_ratio = s_str.apply(lambda x: sum(ch in "!@#$%^&*()=+[]{}<>~`" for ch in x) / max(1, len(x)))
+    arr = sym_ratio.to_numpy(dtype=float)
+    med = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - med)))
+    thr = med + 5 * mad if mad > 0 else 0.5
+    mask_sym = sym_ratio > thr
+    if mask_sym.any():
+        issues.append({
+            "column": s.name, "issue": "weird_symbols_ratio",
+            "criticality": ISSUE_CRITICALITY["weird_symbols_ratio"],
+            "rows": int(mask_sym.sum()),
+            "sample": s_str[mask_sym].head(5).tolist(),
+            "details": {"threshold": thr, "median": med, "mad": mad}
+        })
+    return issues
+
+# =======================
+#  Missing / Duplicates
+# =======================
+def summarize_missing(df: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({
+        "column": df.columns,
+        "dtype": [str(df[c].dtype) for c in df.columns],
+        "non_null": [df[c].notna().sum() for c in df.columns],
+        "missing": [df[c].isna().sum() for c in df.columns],
+        "missing_pct": [df[c].isna().mean() for c in df.columns],
+        "n_unique": [df[c].nunique(dropna=True) for c in df.columns],
+    }).sort_values("missing_pct", ascending=False)
+
+def find_duplicates(df: pd.DataFrame, subset=None) -> tuple[int, pd.DataFrame]:
+    mask = df.duplicated(subset=subset, keep=False) if subset else df.duplicated(keep=False)
+    return int(mask.sum()), df[mask].copy()
+
+# =======================
+#  Cell-level severity (for Dataset coloring)
+# =======================
+def build_severity_df(df: pd.DataFrame, inferred_df: pd.DataFrame, coverage_target: float, future_days: int) -> pd.DataFrame:
+    """
+    Build a DataFrame (same shape as df) with severity numbers per cell:
+    0 (no issue), 1 (LOW), 2 (MEDIUM), 3 (HIGH), 4 (VERY_HIGH)
+    """
+    sev = pd.DataFrame(0, index=df.index, columns=df.columns, dtype=np.int8)
+    kinds = dict(zip(inferred_df["column"], inferred_df["kind"]))
+
+    for col in df.columns:
+        kind = kinds.get(col, "free_text")
+        s = df[col]
+        col_sev = np.zeros(len(df), dtype=np.int8)
+
+        try:
+            if kind == "numeric":
+                parsed = pd.to_numeric(s, errors="coerce")
+                parse_fail = s.notna() & parsed.isna()
+                if parse_fail.any():
+                    col_sev = np.maximum(col_sev, np.where(parse_fail, crit_num("numeric_parse_fail"), 0))
+                m_iqr = iqr_outliers(parsed, k=1.5)
+                if m_iqr.any():
+                    col_sev = np.maximum(col_sev, np.where(m_iqr, crit_num("outlier_iqr"), 0))
+                m_mag = magnitude_outliers(parsed, factor=1e3)
+                if m_mag.any():
+                    col_sev = np.maximum(col_sev, np.where(m_mag, crit_num("outlier_magnitude"), 0))
+
+            elif kind == "percent":
+                # infer scale from inferred_df.details if present
+                row = inferred_df[inferred_df["column"] == col]
+                scale = "0_100"
+                if not row.empty:
+                    for k in row.columns:
+                        if str(k).startswith("detail_") and "scale" in str(k):
+                            scale = row.iloc[0][k] or "0_100"
+                s_stripped = s.astype(str).str.replace("%", "", regex=False)
+                x = pd.to_numeric(s_stripped, errors="coerce")
+                parse_fail = s.notna() & x.isna()
+                if parse_fail.any():
+                    col_sev = np.maximum(col_sev, np.where(parse_fail, crit_num("percent_parse_fail"), 0))
+                if scale == "0_1":
+                    bad = (x < 0) | (x > 1.001)
+                else:
+                    bad = (x < 0) | (x > 100.001)
+                if bad.any():
+                    col_sev = np.maximum(col_sev, np.where(bad, crit_num("percent_out_of_range"), 0))
+                m_iqr = iqr_outliers(x, k=1.5)
+                if m_iqr.any():
+                    col_sev = np.maximum(col_sev, np.where(m_iqr, crit_num("percent_outlier_iqr"), 0))
+
+            elif kind == "date":
+                x = pd.to_datetime(s, errors="coerce", dayfirst=True)
+                parse_fail = s.notna() & x.isna()
+                if parse_fail.any():
+                    col_sev = np.maximum(col_sev, np.where(parse_fail, crit_num("date_parse_fail"), 0))
+                if x.notna().any():
+                    too_old = x < pd.Timestamp(year=1900, month=1, day=1)
+                    too_new = x > (pd.Timestamp.today() + pd.Timedelta(days=future_days))
+                    bad = (too_old | too_new) & x.notna()
+                    if bad.any():
+                        col_sev = np.maximum(col_sev, np.where(bad, crit_num("date_out_of_bounds"), 0))
+
+            elif kind == "email":
+                bad = s.notna() & ~s.astype(str).str.fullmatch(EMAIL_RE)
+                if bad.any():
+                    col_sev = np.maximum(col_sev, np.where(bad, crit_num("email_format"), 0))
+
+            elif kind == "url":
+                bad = s.notna() & ~s.astype(str).str.startswith(("http://", "https://"))
+                if bad.any():
+                    col_sev = np.maximum(col_sev, np.where(bad, crit_num("url_format"), 0))
+
+            elif kind == "categorical":
+                s_non_null = s.dropna()
+                if len(s_non_null) > 0:
+                    vc = s_non_null.value_counts(dropna=False)
+                    cum_cov = 0.0
+                    allowed = set()
+                    for val, cnt in vc.items():
+                        allowed.add(val)
+                        cum_cov += cnt / len(s_non_null)
+                        if cum_cov >= coverage_target or len(allowed) >= 20:
+                            break
+                    mask_rare = s.notna() & ~s.isin(list(allowed))
+                    if mask_rare.any():
+                        col_sev = np.maximum(col_sev, np.where(mask_rare, crit_num("rare_category"), 0))
+
+            elif kind == "free_text":
+                s_str = s.dropna().astype(str)
+                if len(s_str) > 0:
+                    lens = s.astype(str).str.len()
+                    m_len = iqr_outliers(lens, k=2.0)
+                    if m_len.any():
+                        col_sev = np.maximum(col_sev, np.where(m_len, crit_num("text_length_outlier"), 0))
+                    sym_ratio = s.astype(str).apply(lambda x: sum(ch in "!@#$%^&*()=+[]{}<>~`" for ch in x) / max(1, len(x)))
+                    arr = sym_ratio.to_numpy(dtype=float)
+                    med = float(np.median(arr))
+                    mad = float(np.median(np.abs(arr - med)))
+                    thr = med + 5 * mad if mad > 0 else 0.5
+                    m_sym = sym_ratio > thr
+                    if m_sym.any():
+                        col_sev = np.maximum(col_sev, np.where(m_sym, crit_num("weird_symbols_ratio"), 0))
+            # id_like / empty -> no penalties
+        except Exception:
+            # be resilient per column; continue
+            pass
+
+        sev[col] = col_sev.astype(np.int8)
+
+    return sev
+
+# =======================
+#  Full analysis
+# =======================
+def analyze_df(df: pd.DataFrame, dedup_subset=None, coverage_target=0.95, future_days: int = 730) -> dict:
+    issues_all: List[dict] = []
+    inferred = []
+    for col in df.columns:
+        info = infer_kind(df[col])
+        inferred.append({"column": col, "kind": info["kind"], **{f"detail_{k}": v for k, v in info["details"].items()}})
+        kind = info["kind"]
+        if kind == "numeric":
+            issues_all += check_numeric(df[col])
+        elif kind == "percent":
+            scale = info["details"]["scale"]
+            issues_all += check_percent(df[col], scale)
+        elif kind == "date":
+            issues_all += check_date(df[col], future_days=future_days)
+        elif kind == "email":
+            issues_all += check_email(df[col])
+        elif kind == "url":
+            issues_all += check_url(df[col])
+        elif kind == "categorical":
+            issues_all += check_categorical_coherence(df[col], coverage_target=coverage_target)
+        elif kind == "free_text":
+            issues_all += check_free_text_anomalies(df[col])
+        elif kind in {"id_like", "empty"}:
+            pass
+
+    inferred_df = pd.DataFrame(inferred).sort_values("column")
+    issues_df = pd.DataFrame(issues_all)
+    if issues_df.empty:
+        issues_df = pd.DataFrame(columns=["column", "issue", "criticality", "rows", "sample", "details"])
+    else:
+        # order columns
+        issues_df = issues_df[["column", "issue", "criticality", "rows", "sample", "details"]]
+
+    missing_df = summarize_missing(df)
+    n_dups, dups_df = find_duplicates(df, subset=dedup_subset)
+
+    # build cell severity for Dataset coloring
+    severity_df = build_severity_df(df, inferred_df, coverage_target=coverage_target, future_days=future_days)
+
+    # column-level worst criticality & has_issues
+    worst_num_per_col = severity_df.max(axis=0)  # per column
+    inferred_df["has_issues"] = inferred_df["column"].map(lambda c: bool(worst_num_per_col.get(c, 0) > 0))
+    inferred_df["worst_criticality"] = inferred_df["column"].map(lambda c: NUM_TO_CRIT.get(int(worst_num_per_col.get(c, 0)), ""))
+
+    return {
+        "inferred": inferred_df,
+        "issues": issues_df,
+        "missing": missing_df,
+        "duplicates_count": n_dups,
+        "duplicates_df": dups_df,
+        "severity_df": severity_df,  # for coloring
+    }
+
+# =======================
+#  Export to Excel
+# =======================
+def export_excel(df_raw: pd.DataFrame, analysis: dict, out_path: str, max_dataset_rows: int = 200_000):
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    from openpyxl.styles import PatternFill, Font
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
+        # Summary
+        pd.DataFrame({
+            "metric": ["rows", "columns", "duplicates_detected"],
+            "value": [len(df_raw), df_raw.shape[1], analysis["duplicates_count"]],
+        }).to_excel(w, index=False, sheet_name="Summary")
+
+        analysis["inferred"].to_excel(w, index=False, sheet_name="Inferred_Types")
+        analysis["missing"].to_excel(w, index=False, sheet_name="Missing")
+
+        df_issues = analysis["issues"].copy()
+        if not df_issues.empty:
+            df_issues["details"] = df_issues["details"].astype(str)
+            df_issues["sample"] = df_issues["sample"].astype(str)
+        else:
+            df_issues = pd.DataFrame(columns=["column", "issue", "criticality", "rows", "sample", "details"])
+        df_issues.to_excel(w, index=False, sheet_name="Issues")
+
+        analysis["duplicates_df"].head(5000).to_excel(w, index=False, sheet_name="Duplicates")
+
+        # Dataset (may be truncated for very large data)
+        df_to_write = df_raw if len(df_raw) <= max_dataset_rows else df_raw.head(max_dataset_rows)
+        df_to_write.to_excel(w, index=False, sheet_name="Dataset")
+
+        # Cell coloring by criticality on Dataset
+        ws = w.sheets["Dataset"]
+
+        # color mapping
+        FILLS = {
+            1: PatternFill(fill_type="solid", fgColor="FFF2CC"),  # LOW - light yellow
+            2: PatternFill(fill_type="solid", fgColor="FCE4D6"),  # MEDIUM - light orange
+            3: PatternFill(fill_type="solid", fgColor="F8CBAD"),  # HIGH - light red
+            4: PatternFill(fill_type="solid", fgColor="C00000"),  # VERY_HIGH - dark red
+        }
+        WHITE_FONT = Font(color="FFFFFF")
+
+        sev_df = analysis["severity_df"]
+        if len(df_to_write) < len(sev_df):
+            sev_df = sev_df.iloc[: len(df_to_write)]
+        elif len(df_to_write) > len(sev_df):
+            # should not happen, but be safe
+            pad = pd.DataFrame(0, index=df_to_write.index.difference(sev_df.index), columns=sev_df.columns)
+            sev_df = pd.concat([sev_df, pad]).loc[df_to_write.index]
+
+        # Apply fills cell-by-cell (static coloring; robust for export)
+        # Excel rows start at 1; headers at row 1 -> data starts at row 2
+        n_rows, n_cols = df_to_write.shape
+        for r in range(n_rows):
+            for c, col_name in enumerate(df_to_write.columns, start=1):
+                sev = int(sev_df.iloc[r, c - 1])
+                if sev > 0:
+                    cell = ws.cell(row=r + 2, column=c)
+                    cell.fill = FILLS.get(sev)
+                    if sev == 4:
+                        cell.font = WHITE_FONT  # white font on dark red
+
+# =======================
+#  CLI
+# =======================
+def main():
+    ap = argparse.ArgumentParser(description="Universal CSV Analyzer (V0.2) robust + criticality + coloring")
+    ap.add_argument("-i", "--input", help="Path to CSV/TSV/Excel (if omitted, file dialog opens)")
+    ap.add_argument("-o", "--out", help="Excel output path (default: report_TIMESTAMP.xlsx next to input)")
+    ap.add_argument("--dedup", nargs="*", default=None, help="Key columns to DETECT duplicates (no deletion)")
+    ap.add_argument("--coverage", type=float, default=0.95, help="Coverage for categorical coherence (default 0.95)")
+    ap.add_argument("--future-days", type=int, default=730, help="Allowed future horizon for dates (days, default 730)")
+    ap.add_argument("--encoding", help="Force encoding (e.g., utf-16, utf-8, latin1)")
+    ap.add_argument("--sep", help="Force separator: tab, comma, semicolon, pipe or the symbol itself (\\t, ;, , , |)")
+    args = ap.parse_args()
+
+    input_path: Optional[Path] = None
+    if args.input:
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"❌ File does not exist: {input_path}")
+            return
+    else:
+        input_path = pick_file_dialog()
+        if not input_path:
+            if not TK_AVAILABLE:
+                print("⚠️ Tkinter not available. Run with -i/--input to specify the file.")
+            else:
+                print("Operation cancelled. No file selected.")
+            return
+
+    try:
+        df, meta = smart_read_any(input_path, forced_encoding=args.encoding, forced_sep=args.sep)
+    except Exception as e:
+        print("❌ Error reading the file.")
+        print("Tips:")
+        print("  - ERP/Excel exports may be TSV UTF-16: try  --encoding utf-16 --sep tab")
+        print(r"  - Example:  python csv_universal_analyzer.py -i data.csv --encoding utf-16 --sep tab")
+        raise
+
+    print(f"Read: {input_path.name} | encoding={meta.get('encoding')} sep={meta.get('sep')} forced={meta.get('forced', False)} shape={df.shape}")
+
+    analysis = analyze_df(
+        df,
+        dedup_subset=args.dedup,
+        coverage_target=args.coverage,
+        future_days=args.future_days
+    )
+
+    if args.out:
+        out_path = args.out
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        out_path = str(input_path.with_name(f"report_{ts}.xlsx"))
+
+    export_excel(df, analysis, out_path)
+    print(f"✅ Report generated → {out_path}")
+
+if __name__ == "__main__":
+   main()
