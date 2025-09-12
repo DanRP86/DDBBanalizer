@@ -9,23 +9,22 @@ Universal CSV/Excel Analyzer (V0.3)
 - Excel with multiple sheets: picks the sheet with MOST non-null values (or --input-sheet override).
 - Type inference per column: numeric, percent, date, email, url, id_like, categorical, free_text.
 - Checks: missing (toggleable), duplicates (detection), outliers (IQR), magnitude outliers,
-          percent range, date bounds, categorical coherence (95% coverage by default),
-          free text anomalies (length IQR, weird symbol ratio).
-- Criticality mapping (LOW, MEDIUM, HIGH, VERY_HIGH). "missing" is MEDIUM by default.
+          percent range, date bounds, categorical coherence, free text anomalies.
+- Criticality mapping (LOW, MEDIUM, HIGH, VERY_HIGH). "missing" is MEDIUM by default (toggleable).
 - Excel output: Summary, Inferred_Types, Missing, Issues, Duplicates, Dataset (colored by severity),
                 Main_ID (proposed), ID_Candidates.
-- Phase 1 (no --config): produces initial_report_* + config_*.xlsx with Rules/Suggested/Meta.
-- Phase 2 (--config path): applies overrides & suggestions, produces final_report_* and optionally emails
-  per group (Meta.group_col) or per contact (Meta.contact_col). Emails saved as .msg or sent via Outlook.
+- Phase 1 (no --config and no config_* found): produces initial_report_* + config_*.xlsx (Rules/Suggested/Meta).
+- Phase 2 (--config provided OR config_* auto-detected): applies overrides & suggestions, produces final_report_*
+  and optionally emails per group (Meta.group_col) or per contact (Meta.contact_col). Emails saved as .msg or sent via Outlook.
 
 Usage:
   # Phase 1 (create initial report + config)
   python csv_universal_analyzer.py -i data.xlsx
 
   # Phase 2 (read config, generate final + emails if enabled in config)
+  python csv_universal_analyzer.py -i data.xlsx           # autodetects config_data.xlsx if present
+  # or
   python csv_universal_analyzer.py -i data.xlsx --config config_data.xlsx
-
-Author: Daniel + M365 Copilot
 """
 
 import argparse
@@ -75,7 +74,7 @@ SEP_ALIASES = {
     "tab": "\t",
     "comma": ",",
     "semicolon": ";",
-    "pipe": "|",   # Correct pipe alias
+    "pipe": "|",
 }
 
 def normalize_sep_arg(sep_arg: Optional[str]) -> Optional[str]:
@@ -288,7 +287,6 @@ ISSUE_CRITICALITY = {
     "rare_category": "LOW",
     "text_length_outlier": "LOW",
     "weird_symbols_ratio": "MEDIUM",
-    # Future: required, uniqueness, freshness...
 }
 
 def crit_num(issue_code: str) -> int:
@@ -325,7 +323,6 @@ def parse_bool(x, default=False) -> bool:
 
 # =======================
 # Build cell severity (for Dataset coloring)
-# with config overrides (rules) + highlight_null toggle
 # =======================
 def build_severity_df(df: pd.DataFrame, inferred_df: pd.DataFrame, coverage_target: float, future_days: int,
                       rules_df: Optional[pd.DataFrame] = None,
@@ -366,9 +363,7 @@ def build_severity_df(df: pd.DataFrame, inferred_df: pd.DataFrame, coverage_targ
             kind = kind_forced
 
         enabled_checks = set([x.strip().lower() for x in str(r.get("enabled_checks", "")).split(",") if x.strip()]) or None
-
-        def check_enabled(alias):
-            return (enabled_checks is None) or (alias in enabled_checks)
+        def check_enabled(alias): return (enabled_checks is None) or (alias in enabled_checks)
 
         iqr_k = float(r.get("iqr_k", 1.5) or 1.5)
         mag_factor = float(r.get("magnitude_factor", 1_000) or 1_000)
@@ -532,7 +527,6 @@ def analyze_df(df: pd.DataFrame, dedup_subset=None, coverage_target=0.95, future
         inferred.append({"column": col, "kind": info["kind"], **{f"detail_{k}": v for k, v in info["details"].items()}})
         kind = info["kind"]
         if kind == "numeric":
-            # numeric checks at column-level for Issues sheet (summaries)
             parsed = pd.to_numeric(df[col], errors="coerce")
             parse_fail = df[col].notna() & parsed.isna()
             if parse_fail.any():
@@ -573,7 +567,6 @@ def analyze_df(df: pd.DataFrame, dedup_subset=None, coverage_target=0.95, future
                     "sample": df[col][parse_fail].astype(str).head(5).tolist(),
                     "details": {}
                 })
-            # default range [0,100]
             bad = (x < 0) | (x > 100.001)
             if bad.any():
                 issues_all.append({
@@ -689,7 +682,7 @@ def analyze_df(df: pd.DataFrame, dedup_subset=None, coverage_target=0.95, future
         issues_df = issues_df[["column", "issue", "criticality", "rows", "sample", "details"]]
     missing_df = summarize_missing(df)
     n_dups, dups_df = find_duplicates(df, subset=dedup_subset)
-    # temporary severity (without overrides) for phase-1 report
+    # temporary severity (Phase 1 default highlight_null=True)
     severity_df = build_severity_df(df, inferred_df, coverage_target=coverage_target, future_days=future_days,
                                     rules_df=None, highlight_null=True)
     # column-level worst criticality & has_issues
@@ -752,13 +745,10 @@ def detect_main_id(df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
 def generate_config_template(input_path: Path, df: pd.DataFrame, analysis: dict, config_path: Path,
                              coverage_target: float, future_days: int, used_sheet: Optional[str] = None):
     rules = analysis["inferred"].copy()
-    # Clean details cols -> keep as separate fields if present
-    # Prepare Rules columns
     rules["kind_forced"] = ""
     rules["enabled_checks"] = ""  # empty -> defaults by kind
     rules["date_min"] = ""
     rules["date_max"] = ""
-    # Extract possible percent scale from details
     if "detail_scale" in rules.columns:
         rules["percent_scale"] = rules["detail_scale"]
     else:
@@ -771,7 +761,6 @@ def generate_config_template(input_path: Path, df: pd.DataFrame, analysis: dict,
     rules["text_len_check"] = True
     rules["weird_symbols_check"] = True
     rules["missing_check"] = True  # per column
-    # Severity overrides (leave empty to use defaults)
     sev_cols = [
         "sev_missing",
         "sev_numeric_parse_fail","sev_outlier_iqr","sev_outlier_magnitude",
@@ -781,7 +770,6 @@ def generate_config_template(input_path: Path, df: pd.DataFrame, analysis: dict,
     ]
     for c in sev_cols:
         rules[c] = ""
-    # Remove internal detail_* cols from Rules (keep kind_inferred only)
     for c in list(rules.columns):
         if str(c).startswith("detail_"):
             rules.drop(columns=[c], inplace=True)
@@ -791,7 +779,6 @@ def generate_config_template(input_path: Path, df: pd.DataFrame, analysis: dict,
     for col in df.columns:
         s = df[col]
         row = {"column": col}
-        # numerics
         s_num = pd.to_numeric(s.astype(str).str.replace("%", "", regex=False), errors="coerce")
         if s_num.notna().any():
             row.update({
@@ -802,7 +789,6 @@ def generate_config_template(input_path: Path, df: pd.DataFrame, analysis: dict,
                 "num_max": float(s_num.max()),
                 "iqr_k_suggest": 1.5
             })
-        # dates
         s_dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
         if s_dt.notna().any():
             row.update({
@@ -811,12 +797,10 @@ def generate_config_template(input_path: Path, df: pd.DataFrame, analysis: dict,
                 "date_min_suggest": s_dt.quantile(0.01),
                 "date_max_suggest": s_dt.quantile(0.99)
             })
-        # text
         s_str = s.dropna().astype(str)
         if len(s_str) > 0:
             lens = s_str.str.len()
             row.update({"avg_len": float(lens.mean()), "p95_len": float(lens.quantile(0.95))})
-        # categorical
         vc = s.value_counts(dropna=True)
         if len(vc) > 0:
             top_vals = vc.head(20).index.tolist()
@@ -826,7 +810,6 @@ def generate_config_template(input_path: Path, df: pd.DataFrame, analysis: dict,
                 "top_values": ",".join(map(lambda x: str(x), top_vals)),
                 "allowed_values_suggest": ",".join(map(lambda x: str(x), top_vals))
             })
-        # percent
         if s.astype(str).str.contains("%").mean() > 0.5:
             row["percent_scale_suggest"] = "0_100"
         row["adopt"] = False
@@ -878,10 +861,8 @@ def read_config(config_path: Path) -> dict:
     for _, r in meta_df.iterrows():
         k, v = str(r["key"]), r["value"]
         meta[k] = v
-    # normalize booleans
     meta["highlight_null"] = parse_bool(meta.get("highlight_null", True), default=True)
     meta["send"] = parse_bool(meta.get("send", False), default=False)
-    # notify_mode
     nm = str(meta.get("notify_mode", "none")).strip().lower()
     meta["notify_mode"] = nm if nm in {"none", "group", "contact"} else "none"
     meta["group_col"] = str(meta.get("group_col", "Country"))
@@ -1167,6 +1148,14 @@ def main():
                 print("Operation cancelled. No file selected.")
             return
 
+    # --- AUTODETECCIÓN DE CONFIG (si no se pasó --config) ---
+    if not args.config:
+        auto_cfg = input_path.with_name(f"config_{input_path.stem}.xlsx")
+        if auto_cfg.exists():
+            print(f"🧭 Auto-config detected: {auto_cfg.name} — entering FINAL phase.")
+            args.config = str(auto_cfg)
+    # --------------------------------------------------------
+
     # 2) Read data (Excel: auto-select sheet with most data if not forced)
     try:
         df, meta = smart_read_any(input_path, forced_encoding=args.encoding, forced_sep=args.sep, input_sheet=args.input_sheet)
@@ -1177,7 +1166,7 @@ def main():
         print(r" - Example: python csv_universal_analyzer.py -i data.csv --encoding utf-16 --sep tab")
         raise
 
-    used_sheet = meta.get("sheet") if isinstance(meta.get("sep", ""), str) and str(meta.get("sep", "")).startswith("excel:") else None
+    used_sheet = meta.get("sheet")
     print(f"Read: {input_path.name} encoding={meta.get('encoding')} sep={meta.get('sep')} forced={meta.get('forced', False)} shape={df.shape}")
 
     # 3) Initial analysis (inferred rules, issues, missing, duplicates, base severity)
@@ -1190,7 +1179,7 @@ def main():
         main_id, cand_df = detect_main_id(df)
         print(f"🔎 Main ID candidate detected: {main_id}")
 
-    # 5) Phase handling: if config provided -> FINAL phase; else -> INITIAL phase
+    # 5) Phase handling: if config provided (explicit or auto) -> FINAL phase; else -> INITIAL phase
     config = None
     if args.config:
         # Read and apply config (FINAL)
@@ -1231,7 +1220,7 @@ def main():
         else:
             out_path = str(input_path.with_name(f"final_report_{input_path.stem}_{ts}.xlsx"))
 
-        # Export final report (no Suggested here; Suggested lives in config.xlsx)
+        # Export final report
         export_excel(df, analysis, out_path, main_id_name=main_id, id_candidates=cand_df)
         print(f"✅ Final report generated → {out_path}")
 
@@ -1253,15 +1242,14 @@ def main():
                 print(f"⚠️ Error generating emails: {e}")
 
     else:
-        # INITIAL phase: produce initial_report + config (with Suggested & toggles)
-        # Recompute severity with default highlight_null=True (already done in analyze_df)
+        # INITIAL phase: initial_report + config (with Suggested & toggles)
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         if args.out:
             out_path = args.out
         else:
             out_path = str(input_path.with_name(f"initial_report_{input_path.stem}_{ts}.xlsx"))
-        # Also include Suggested sheet in the initial report for visibility
-        # Build Suggested the same way as in config template
+
+        # Suggested (simple) para visualizar en el initial_report
         sugg_rows = []
         for col in df.columns:
             s = df[col]
@@ -1299,7 +1287,8 @@ def main():
             coverage_target=args.coverage, future_days=args.future_days, used_sheet=used_sheet
         )
         print(f"📝 Config template generated → {config_path}")
-        print("➡️  Edita 'config_*.xlsx' (Rules/Suggested/Meta) y re-ejecuta con --config para generar el final y, si quieres, emails.")
+        print("➡️  Edita 'config_*.xlsx' (Rules/Suggested/Meta) y vuelve a ejecutar el MISMO comando; "
+              "la autodetección de config entrará en FASE FINAL automáticamente.")
 
 if __name__ == "__main__":
     main()
