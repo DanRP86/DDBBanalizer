@@ -2,18 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Universal CSV/Excel Analyzer — Simple Config (EN V0.5.1)
+Universal CSV/Excel Analyzer — Simple Config (EN V0.5.2)
 --------------------------------------------------------
-Fixes & Enhancements over V0.5:
-- Robust numeric parsing for CONFIG limits (handles "," vs "." and thousands separators). Prevents silent skipping of new min/max.
-- Safer date inference (no warning when strings are ISO date/datetime; uses dayfirst only when appropriate).
-- Emails: add optional 'email_recipients_column' in Emails row to explicitly pick a recipients column.
-- Emails: if Emails.domain does not exist, attempt smart fallback (Contact → first email-like column → first categorical). Clear console notice.
-- Emails: new 'IssueColumns' column (lists columns with HIGH/VERY_HIGH severities per row) so counts match visible issues.
-- CONFIG defaults: Emails.domain left blank by default to force an explicit choice (reduces accidental 'Country' when not present).
-- All headers remain English; HELP + Data Validations preserved.
-
-Requirements: pandas, numpy, openpyxl (optional: pywin32 to save .MSG via Outlook COM)
+Diagnostics for limits + minor fixes over V0.5.1:
+- NEW: --debug flag prints per-column rule application, parsed min/max and counts (below/above);
+        also exports a 'Rules_Applied' sheet and a 'QA_DIAG_[col].xlsx' sampler for columns with limits.
+- Robust numeric parsing kept (locale-aware). Extra trimming of stray characters (NBSP, currency signs).
+- Safer date inference logs suppressed; ISO datetime handled.
+- Emails improvements from V0.5.1 retained (recipients column, IssueColumns, auto-pick domain).
 """
 
 import argparse
@@ -174,29 +170,40 @@ def parse_cfg_date(val):
             return pd.to_datetime(s, errors="coerce", dayfirst=False)
     return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
+NBSP = '\xa0'
+CURRENCY_SIGNS = set(list('$€£¥'))
+
+
+def clean_numeric_string(s: str) -> str:
+    s = s.replace(NBSP, ' ').strip()
+    # remove spaces inside numbers
+    s = s.replace(' ', '')
+    # strip currency at either end
+    if s and s[0] in CURRENCY_SIGNS:
+        s = s[1:]
+    if s and s[-1] in CURRENCY_SIGNS:
+        s = s[:-1]
+    return s
+
 
 def parse_num_locale(val) -> Optional[float]:
-    """Parse numbers tolerant to locales and separators (e.g., 1.234,56 or 1,234.56)."""
     if val in (None, "", np.nan):
         return None
     if isinstance(val, (int, float)) and not pd.isna(val):
         return float(val)
-    s = str(val).strip()
-    # Remove spaces
-    s = s.replace(" ", "")
-    # Replace thousand separators heuristically
-    # Case 1: dot as thousand sep and comma as decimal: 1.234,56 -> 1234.56
+    s = clean_numeric_string(str(val))
+    # dot thousands + comma decimal: 1.234,56 -> 1234.56
     if re.match(r"^\d{1,3}(\.\d{3})+,\d+$", s):
-        s = s.replace(".", "").replace(",", ".")
-    # Case 2: comma as thousand sep and dot as decimal: 1,234.56 -> 1234.56
+        s = s.replace('.', '').replace(',', '.')
+    # comma thousands + dot decimal: 1,234.56 -> 1234.56
     elif re.match(r"^\d{1,3}(,\d{3})+\.\d+$", s):
-        s = s.replace(",", "")
-    # Case 3: only comma decimal: 123,45 -> 123.45
+        s = s.replace(',', '')
+    # only comma decimal: 123,45 -> 123.45
     elif re.match(r"^\d+,\d+$", s):
-        s = s.replace(",", ".")
-    # Case 4: only thousand sep (dot or comma): 1.234 or 1,234 -> remove sep
+        s = s.replace(',', '.')
+    # only thousands (dot or comma): 1.234 or 1,234 -> remove sep
     elif re.match(r"^\d{1,3}[\.,]\d{3}$", s):
-        s = s.replace(",", "").replace(".", "")
+        s = s.replace(',', '').replace('.', '')
     try:
         return float(s)
     except Exception:
@@ -204,23 +211,14 @@ def parse_num_locale(val) -> Optional[float]:
 
 
 def infer_kind(s: pd.Series, sample_size: int = 500) -> str:
-    """V0.5 policy: default free_text unless clear evidence.
-    categorical only if ≤10 distinct values cover ≥80% of non-null entries.
-    Prevents ISO datetime + dayfirst warnings.
-    """
     s_non = s.dropna()
     if len(s_non) == 0:
         return "free_text"
-
     sample = s_non.sample(min(sample_size, len(s_non)), random_state=42).astype(str).str.strip()
-
-    # Email / URL
     if sample.str.fullmatch(EMAIL_RE).mean() > 0.6:
         return "email"
     if sample.str.startswith(("http://", "https://")).mean() > 0.6:
         return "url"
-
-    # Date/datetime: avoid dayfirst warning on ISO
     iso_mask = sample.str.match(ISO_DATE_RE) | sample.str.match(ISO_DATETIME_RE)
     if iso_mask.mean() > 0.7:
         if pd.to_datetime(sample[iso_mask], errors="coerce", dayfirst=False).notna().mean() > 0.7:
@@ -228,8 +226,6 @@ def infer_kind(s: pd.Series, sample_size: int = 500) -> str:
     else:
         if pd.to_datetime(sample, errors="coerce", dayfirst=True).notna().mean() > 0.7:
             return "date"
-
-    # Numeric/percent
     parsed = sample.apply(parse_num_locale)
     if parsed.notna().mean() > 0.7:
         inside_0_1 = ((parsed>=0)&(parsed<=1)).mean()
@@ -237,20 +233,15 @@ def infer_kind(s: pd.Series, sample_size: int = 500) -> str:
         if sample.str.contains('%', regex=False).mean() > 0.05 or max(inside_0_1, inside_0_100) > 0.85:
             return "percent"
         return "numeric"
-
-    # ID heuristic
     nunique = s_non.nunique(dropna=True)
     uniq_ratio = nunique / len(s_non)
     avg_len = sample.str.len().mean()
     if uniq_ratio > 0.9 and avg_len <= 40 and sample.str.fullmatch(ALNUM_RE).mean() > 0.7:
         return "id"
-
-    # Categorical rule (V0.5): ≤10 distinct covering ≥80%
     vc = s_non.astype(str).value_counts(dropna=True)
     top10_cov = (vc.head(10).sum() / len(s_non)) if len(vc) else 0.0
     if (len(vc) <= 10 and top10_cov >= 0.8):
         return "categorical"
-
     return "free_text"
 
 # =======================
@@ -261,6 +252,7 @@ NUM_TO_CRIT = {v: k for k, v in CRIT_TO_NUM.items()}
 ISSUE_DEFAULT = {
     "missing": "MEDIUM",
     "numeric_parse_fail": "HIGH",
+    "numeric_out_of_range": "HIGH",
     "outlier_iqr": "MEDIUM",
     "outlier_magnitude": "HIGH",
     "percent_parse_fail": "HIGH",
@@ -299,7 +291,7 @@ def to_priority_num(s) -> int:
     return CRIT_TO_NUM.get(s.strip().upper(), 0)
 
 # =======================
-# Severity builder (simple)
+# Severity builder (simple) + DEBUG
 # =======================
 
 def iqr_outliers(x: pd.Series, k: float = 1.5) -> pd.Series:
@@ -323,7 +315,6 @@ def apply_base_priority(col_sev_arr: np.ndarray, mask: pd.Series, issue_code: st
     arr_mask = np.where(mask.to_numpy(), num, 0)
     return np.maximum(col_sev_arr, arr_mask)
 
-# CONFIG columns (EN)
 CONFIG_COLUMNS = [
     'column', 'type', 'min', 'max', 'domain', 'regex', 'priority', 'active', 'highlight_nulls', 'include_null_in_email'
 ]
@@ -354,21 +345,16 @@ def normalize_config_headers(cfg: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_severity_simple(df: pd.DataFrame, config_rows: pd.DataFrame, coverage_target: float,
-                          future_days: int, main_id_col: Optional[str]) -> Tuple[pd.DataFrame, Dict[str, dict], dict]:
-    # Keep a raw copy to read Emails extra fields before normalization drops them
-    raw = config_rows.copy()
-    raw.columns = [str(c).strip().lower() for c in raw.columns]
-
-    # Extract Emails extras from raw (if present)
+                          future_days: int, main_id_col: Optional[str], debug: bool = False,
+                          rules_dump: Optional[List[dict]] = None) -> Tuple[pd.DataFrame, Dict[str, dict], dict]:
+    raw = config_rows.copy(); raw.columns = [str(c).strip().lower() for c in raw.columns]
     emails_row = None
     if 'column' in raw.columns:
-        emails_mask = raw['column'].astype(str).str.strip().str.lower().eq('emails')
-        if emails_mask.any():
-            emails_row = raw[emails_mask].iloc[-1]
+        mask = raw['column'].astype(str).str.strip().str.lower().eq('emails')
+        if mask.any(): emails_row = raw[mask].iloc[-1]
     elif 'columna' in raw.columns:
-        emails_mask = raw['columna'].astype(str).str.strip().str.lower().eq('emails')
-        if emails_mask.any():
-            emails_row = raw[emails_mask].iloc[-1]
+        mask = raw['columna'].astype(str).str.strip().str.lower().eq('emails')
+        if mask.any(): emails_row = raw[mask].iloc[-1]
 
     cfg = normalize_config_headers(config_rows.copy())
 
@@ -386,32 +372,13 @@ def build_severity_simple(df: pd.DataFrame, config_rows: pd.DataFrame, coverage_
             'email_summary': True,
             'email_recipients_column': '',
         }
-        # Pull extra fields from raw Emails row if any
         if emails_row is not None:
             est = str(emails_row.get('email_severity_threshold','') or '').strip().upper()
-            if est in ('HIGH','VERY_HIGH'):
-                control['email_severity_threshold'] = est
-            esm = emails_row.get('email_summary','')
-            control['email_summary'] = parse_bool(esm, default=True)
+            if est in ('HIGH','VERY_HIGH'): control['email_severity_threshold'] = est
+            control['email_summary'] = parse_bool(emails_row.get('email_summary',''), default=True)
             erc = str(emails_row.get('email_recipients_column','') or '').strip()
-            if erc:
-                control['email_recipients_column'] = erc
+            if erc: control['email_recipients_column'] = erc
         cfg = cfg[~mask_emails]
-    else:
-        # Legacy: __CONTROL__
-        mask_ctrl = raw['columna'].astype(str).str.strip().eq('__CONTROL__') if 'columna' in raw.columns else pd.Series(False, index=raw.index)
-        if mask_ctrl.any():
-            last = raw[mask_ctrl].iloc[-1]
-            control = {
-                'email_to': str(last.get('min_propuesto','') or '').strip(),
-                'group_col': str(last.get('dominio','') or '').strip(),
-                'generate': parse_bool(last.get('activo','NO'), default=False),
-                'email_severity_threshold': 'HIGH',
-                'email_summary': True,
-                'email_recipients_column': '',
-            }
-            raw = raw[~mask_ctrl]
-            cfg = normalize_config_headers(raw)
 
     mask_mainid = cfg['column'].astype(str).str.strip().str.lower().eq('main id')
     if mask_mainid.any():
@@ -419,12 +386,10 @@ def build_severity_simple(df: pd.DataFrame, config_rows: pd.DataFrame, coverage_
         forced_main_id = str(row.get('domain','') or '').strip()
         cfg = cfg[~mask_mainid]
 
-    # Rules per column
     rule_map: Dict[str, dict] = {}
     for _, r in cfg.iterrows():
         col = str(r.get('column','') or '').strip()
-        if not col:
-            continue
+        if not col: continue
         rule_map[col] = {
             'type': str(r.get('type','') or '').strip().lower(),
             'min': r.get('min', None),
@@ -437,7 +402,6 @@ def build_severity_simple(df: pd.DataFrame, config_rows: pd.DataFrame, coverage_
             'include_null_in_email': parse_bool(r.get('include_null_in_email','NO'), default=False),
         }
 
-    # Build severity matrix
     sev = pd.DataFrame(0, index=df.index, columns=df.columns, dtype=np.int8)
 
     for col in df.columns:
@@ -449,139 +413,126 @@ def build_severity_simple(df: pd.DataFrame, config_rows: pd.DataFrame, coverage_
         highlight_nulls = True if not rule else bool(rule['highlight_nulls'])
 
         col_sev = np.zeros(len(s), dtype=np.int8)
+        applied = {'column': col, 'type': ctype, 'priority': NUM_TO_CRIT.get(base_pri, ''), 'min': None, 'max': None}
 
         if highlight_nulls:
             is_null = s.isna()
-            if is_null.any():
-                col_sev = np.maximum(col_sev, np.where(is_null, crit_num('missing'), 0))
-
+            if is_null.any(): col_sev = np.maximum(col_sev, np.where(is_null, crit_num('missing'), 0))
         if not active:
             sev[col] = col_sev
+            if rules_dump is not None: rules_dump.append(applied)
             continue
 
-        # Constraints
         dom_vals: Set[str] = set()
         if rule and rule.get('domain') and isinstance(rule.get('domain'), str):
             dom_vals = {v.strip() for v in str(rule.get('domain')).split(',') if v.strip()}
         regex_pat = None
         if rule and rule.get('regex') and isinstance(rule.get('regex'), str) and rule.get('regex').strip():
-            try:
-                regex_pat = re.compile(str(rule.get('regex')).strip())
-            except re.error:
-                regex_pat = None
+            try: regex_pat = re.compile(str(rule.get('regex')).strip())
+            except re.error: regex_pat = None
         min_v = rule.get('min') if rule else None
         max_v = rule.get('max') if rule else None
 
         try:
             if ctype == 'numeric':
-                x = pd.to_numeric(s, errors='coerce')
+                x = pd.to_numeric(s.apply(lambda v: clean_numeric_string(str(v)) if pd.notna(v) else v), errors='coerce')
                 parse_fail = s.notna() & x.isna()
-                if parse_fail.any():
-                    col_sev = apply_base_priority(col_sev, parse_fail, 'numeric_parse_fail', base_pri)
-                v = parse_num_locale(min_v)
-                if v is not None:
-                    m = x < v
-                    col_sev = apply_base_priority(col_sev, m, 'percent_out_of_range', base_pri)
-                v = parse_num_locale(max_v)
-                if v is not None:
-                    m = x > v
-                    col_sev = apply_base_priority(col_sev, m, 'percent_out_of_range', base_pri)
+                if parse_fail.any(): col_sev = apply_base_priority(col_sev, parse_fail, 'numeric_parse_fail', base_pri)
+                lo = parse_num_locale(min_v)
+                hi = parse_num_locale(max_v)
+                applied['min'] = lo; applied['max'] = hi
+                if lo is not None:
+                    m = x < lo
+                    col_sev = apply_base_priority(col_sev, m, 'numeric_out_of_range', base_pri)
+                if hi is not None:
+                    m = x > hi
+                    col_sev = apply_base_priority(col_sev, m, 'numeric_out_of_range', base_pri)
                 m_iqr = iqr_outliers(x, k=1.5)
-                if m_iqr.any():
-                    col_sev = apply_base_priority(col_sev, m_iqr, 'outlier_iqr', base_pri)
+                if m_iqr.any(): col_sev = apply_base_priority(col_sev, m_iqr, 'outlier_iqr', base_pri)
                 m_mag = magnitude_outliers(x, factor=1e3)
-                if m_mag.any():
-                    col_sev = apply_base_priority(col_sev, m_mag, 'outlier_magnitude', base_pri)
+                if m_mag.any(): col_sev = apply_base_priority(col_sev, m_mag, 'outlier_magnitude', base_pri)
                 if dom_vals:
                     bad = s.notna() & ~s.astype(str).isin(dom_vals)
-                    if bad.any():
-                        col_sev = apply_base_priority(col_sev, bad, 'domain_violation', base_pri)
+                    if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'domain_violation', base_pri)
                 if regex_pat:
                     bad = s.notna() & ~s.astype(str).apply(lambda v: bool(regex_pat.fullmatch(str(v))))
-                    if bad.any():
-                        col_sev = apply_base_priority(col_sev, bad, 'regex_violation', base_pri)
+                    if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'regex_violation', base_pri)
 
             elif ctype == 'percent':
                 s_stripped = s.astype(str).str.replace('%','', regex=False)
-                x = pd.to_numeric(s_stripped, errors='coerce')
+                x = pd.to_numeric(s_stripped.apply(clean_numeric_string), errors='coerce')
                 parse_fail = s.notna() & x.isna()
-                if parse_fail.any():
-                    col_sev = apply_base_priority(col_sev, parse_fail, 'percent_parse_fail', base_pri)
-                v = parse_num_locale(min_v); lo = 0.0 if v is None else v
-                v = parse_num_locale(max_v); hi = 100.0 if v is None else v
+                if parse_fail.any(): col_sev = apply_base_priority(col_sev, parse_fail, 'percent_parse_fail', base_pri)
+                lo = parse_num_locale(min_v); hi = parse_num_locale(max_v)
+                applied['min'] = lo; applied['max'] = hi
+                lo = 0.0 if lo is None else lo; hi = 100.0 if hi is None else hi
                 bad = (x < lo) | (x > hi)
-                if bad.any():
-                    col_sev = apply_base_priority(col_sev, bad, 'percent_out_of_range', base_pri)
+                if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'percent_out_of_range', base_pri)
                 m_iqr = iqr_outliers(x, k=1.5)
-                if m_iqr.any():
-                    col_sev = apply_base_priority(col_sev, m_iqr, 'percent_outlier_iqr', base_pri)
+                if m_iqr.any(): col_sev = apply_base_priority(col_sev, m_iqr, 'percent_outlier_iqr', base_pri)
 
             elif ctype == 'date':
                 x = pd.to_datetime(s, errors='coerce', dayfirst=True)
                 parse_fail = s.notna() & x.isna()
-                if parse_fail.any():
-                    col_sev = apply_base_priority(col_sev, parse_fail, 'date_parse_fail', base_pri)
+                if parse_fail.any(): col_sev = apply_base_priority(col_sev, parse_fail, 'date_parse_fail', base_pri)
                 if x.notna().any():
                     lower = parse_cfg_date(min_v) if min_v not in (None, '') else pd.Timestamp('1900-01-01')
                     upper = parse_cfg_date(max_v) if max_v not in (None, '') else (pd.Timestamp.today()+pd.Timedelta(days=future_days))
+                    applied['min'] = str(lower) if lower is not None else None
+                    applied['max'] = str(upper) if upper is not None else None
                     bad = ((x < lower) | (x > upper)) & x.notna()
-                    if bad.any():
-                        col_sev = apply_base_priority(col_sev, bad, 'date_out_of_bounds', base_pri)
+                    if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'date_out_of_bounds', base_pri)
 
             elif ctype == 'email':
                 bad = s.notna() & ~s.astype(str).str.fullmatch(EMAIL_RE)
-                if bad.any():
-                    col_sev = apply_base_priority(col_sev, bad, 'email_format', base_pri)
+                if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'email_format', base_pri)
 
             elif ctype == 'url':
                 bad = s.notna() & ~s.astype(str).str.startswith(("http://", "https://"))
-                if bad.any():
-                    col_sev = apply_base_priority(col_sev, bad, 'url_format', base_pri)
+                if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'url_format', base_pri)
 
             elif ctype == 'categorical':
                 if dom_vals:
                     bad = s.notna() & ~s.astype(str).isin(dom_vals)
-                    if bad.any():
-                        col_sev = apply_base_priority(col_sev, bad, 'domain_violation', base_pri)
+                    if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'domain_violation', base_pri)
                 if regex_pat:
                     bad = s.notna() & ~s.astype(str).apply(lambda v: bool(regex_pat.fullmatch(str(v))))
-                    if bad.any():
-                        col_sev = apply_base_priority(col_sev, bad, 'regex_violation', base_pri)
+                    if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'regex_violation', base_pri)
 
             elif ctype == 'free_text':
                 s_str = s.dropna().astype(str)
                 if len(s_str) > 0:
-                    lens = s.astype(str).str.len()
-                    m_len = iqr_outliers(lens, k=2.0)
-                    if m_len.any():
-                        col_sev = apply_base_priority(col_sev, m_len, 'text_length_outlier', base_pri)
+                    lens = s.astype(str).str.len(); m_len = iqr_outliers(lens, k=2.0)
+                    if m_len.any(): col_sev = apply_base_priority(col_sev, m_len, 'text_length_outlier', base_pri)
                     sym_ratio = s.astype(str).apply(lambda x: sum(ch in "!@#$%^&*()=+[]{}<>~`" for ch in x)/max(1,len(x)))
-                    arr = sym_ratio.to_numpy(dtype=float)
-                    med = float(np.median(arr)); mad = float(np.median(np.abs(arr - med)))
-                    thr = med + 5*mad if mad > 0 else 0.5
+                    arr = sym_ratio.to_numpy(dtype=float); med=float(np.median(arr)); mad=float(np.median(np.abs(arr-med)))
+                    thr = med + 5*mad if mad>0 else 0.5
                     m_sym = sym_ratio > thr
-                    if m_sym.any():
-                        col_sev = apply_base_priority(col_sev, m_sym, 'weird_symbols_ratio', base_pri)
+                    if m_sym.any(): col_sev = apply_base_priority(col_sev, m_sym, 'weird_symbols_ratio', base_pri)
         except Exception:
-            # Ensure we do not silently lose the column; keep any already-set severities
             pass
 
         sev[col] = col_sev.astype(np.int8)
+        if rules_dump is not None:
+            # quick counts
+            arr = col_sev
+            applied['count_LOW'] = int((arr==1).sum())
+            applied['count_MED'] = int((arr==2).sum())
+            applied['count_HIGH'] = int((arr==3).sum())
+            applied['count_VHIGH'] = int((arr==4).sum())
+            rules_dump.append(applied)
 
-    if forced_main_id:
-        control['main_id_forced'] = forced_main_id
-
+    if forced_main_id: control['main_id_forced'] = forced_main_id
     return sev, rule_map, control
 
 # =======================
-# Main ID detection
+# ID detection
 # =======================
 ID_NAME_HINTS = [r"\b(id|code|codigo|código|employee|empleado|vin|matricula|matrícula|plate|nif|dni|cif|cedula|cédula|passport)\b"]
 
 def score_id_candidate(col_name: str, s: pd.Series) -> float:
     s_non = s.dropna(); total = len(s)
-    if total == 0:
-        return 0.0
+    if total == 0: return 0.0
     nunique = s_non.nunique(dropna=True)
     uniq_ratio = (nunique / len(s_non)) if len(s_non) else 0.0
     s_str = s_non.astype(str).str.strip()
@@ -590,31 +541,64 @@ def score_id_candidate(col_name: str, s: pd.Series) -> float:
     as_date = pd.to_datetime(s_non, errors='coerce', dayfirst=True).notna().mean() if len(s_non) else 0.0
     as_num  = pd.to_numeric(s_non, errors='coerce').notna().mean() if len(s_non) else 0.0
     name_hint = any(re.search(pat, col_name, flags=re.IGNORECASE) for pat in ID_NAME_HINTS)
-    score = 0.0
-    if name_hint: score += 3.0
-    if uniq_ratio >= 0.98: score += 3.0
-    elif uniq_ratio >= 0.9: score += 2.0
-    if 6 <= avg_len <= 40: score += 1.0
-    if alnum_ratio >= 0.8: score += 1.0
-    if as_date <= 0.05: score += 0.5
-    if as_num <= 0.5:  score += 0.5
+    score=0.0
+    if name_hint: score+=3.0
+    if uniq_ratio>=0.98: score+=3.0
+    elif uniq_ratio>=0.9: score+=2.0
+    if 6<=avg_len<=40: score+=1.0
+    if alnum_ratio>=0.8: score+=1.0
+    if as_date<=0.05: score+=0.5
+    if as_num<=0.5: score+=0.5
     return score
 
-
 def detect_main_id(df: pd.DataFrame) -> str:
-    if df.shape[1] == 0:
-        return 'row_id'
+    if df.shape[1]==0: return 'row_id'
     best, best_score = df.columns[0], -1.0
     for c in df.columns:
         sc = score_id_candidate(c, df[c])
-        if sc > best_score:
-            best, best_score = c, sc
+        if sc>best_score: best, best_score = c, sc
     return best
 
 # =======================
-# CONFIG generator & reader + HELP + Validations
+# Export report
 # =======================
 from openpyxl.styles import PatternFill, Font
+
+
+def export_excel(df_raw: pd.DataFrame, sev_df: pd.DataFrame, out_path: Path,
+                 summary_extra: Dict[str, str], main_id_name: str,
+                 rules_applied: Optional[pd.DataFrame] = None) -> None:
+    out_dir = out_path.parent; out_dir.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine='openpyxl') as w:
+        # Summary
+        summary_rows={'metric':[], 'value':[]}
+        for k,v in { 'rows': len(df_raw), 'columns': df_raw.shape[1], **summary_extra }.items():
+            summary_rows['metric'].append(k); summary_rows['value'].append(v)
+        pd.DataFrame(summary_rows).to_excel(w, index=False, sheet_name='Summary')
+        # Dataset
+        df_raw.to_excel(w, index=False, sheet_name='Dataset')
+        # Main ID
+        pd.DataFrame({'key':['main_id'], 'value':[main_id_name]}).to_excel(w, index=False, sheet_name='Main_ID')
+        # Rules applied (optional)
+        if rules_applied is not None:
+            rules_applied.to_excel(w, index=False, sheet_name='Rules_Applied')
+        # Coloring
+        ws=w.sheets['Dataset']
+        FILLS={1:PatternFill(fill_type='solid', fgColor='FFF2CC'), 2:PatternFill(fill_type='solid', fgColor='FCE4D6'),
+               3:PatternFill(fill_type='solid', fgColor='F8CBAD'), 4:PatternFill(fill_type='solid', fgColor='C00000')}
+        WHITE=Font(color='FFFFFF')
+        n_rows, n_cols = df_raw.shape
+        for r in range(n_rows):
+            for c in range(n_cols):
+                sev=int(sev_df.iat[r,c])
+                if sev>0:
+                    cell = ws.cell(row=r+2, column=c+1)
+                    cell.fill = FILLS.get(sev)
+                    if sev==4: cell.font=WHITE
+
+# =======================
+# Config generator + HELP + Validations (same as V0.5.1)
+# =======================
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -635,155 +619,94 @@ def _help_text() -> List[str]:
         "   - include_null_in_email: only NULLs in columns marked YES will appear in email drafts.",
         "4) Re-run the same command to generate the final report and email drafts.",
         "",
-        "Type inference (V0.5.x):",
-        "- Default is free_text. A column becomes categorical only if ≤10 distinct values cover ≥80% of non-null entries.",
-        "",
-        "Emails (V0.5.x):",
-        "- Drafts include only HIGH and VERY_HIGH issues (threshold in 'Emails' row).",
-        "- Summary block optional (email_summary).",
-        "- Drafts are saved as .msg (Outlook) or .html. No sending occurs.",
+        "Type inference (V0.5.x): default free_text unless categorical condition is met.",
+        "Emails: only HIGH/VERY_HIGH issues; optional summary; never sends.",
     ]
 
 
 def apply_config_validations(writer, cfg_df: pd.DataFrame, df_columns: List[str]) -> None:
-    wb = writer.book
-    ws_cfg = writer.sheets['CONFIG']
-
-    ws_lists = wb.create_sheet('LISTS')
-    ws_lists.sheet_state = 'hidden'
-
-    types = ["numeric","percent","date","email","url","categorical","free_text","id"]
-    priorities = ["LOW","MEDIUM","HIGH","VERY_HIGH"]
-    yesno = ["YES","NO"]
-
-    for i, v in enumerate(types, 1): ws_lists.cell(row=i, column=1, value=v)
-    for i, v in enumerate(priorities, 1): ws_lists.cell(row=i, column=2, value=v)
-    for i, v in enumerate(yesno, 1): ws_lists.cell(row=i, column=3, value=v)
-    for i, v in enumerate(df_columns, 1): ws_lists.cell(row=i, column=4, value=str(v))  # dataset headers
-
-    headers = [str(c).strip().lower() for c in cfg_df.columns]
-    def col_idx(name):
-        return headers.index(name) + 1 if name in headers else None
-
-    n_rows = len(cfg_df) + 1
-
-    dv_type = DataValidation(type="list", formula1="=LISTS!$A$1:$A$8", allow_blank=True)
-    dv_priority = DataValidation(type="list", formula1="=LISTS!$B$1:$B$4", allow_blank=True)
-    dv_yesno = DataValidation(type="list", formula1="=LISTS!$C$1:$C$2", allow_blank=True)
-    dv_headers = DataValidation(type="list", formula1=f"=LISTS!$D$1:$D${len(df_columns)}", allow_blank=True)
-
-    for dv in (dv_type, dv_priority, dv_yesno, dv_headers):
-        ws_cfg.add_data_validation(dv)
-
-    def apply_range(col_name: str, dv):
-        c = col_idx(col_name)
-        if c is None: return
-        col_letter = get_column_letter(c)
-        dv.add(f"{col_letter}2:{col_letter}{n_rows}")
-
-    # Per-column area
+    wb = writer.book; ws_cfg = writer.sheets['CONFIG']
+    ws_lists = wb.create_sheet('LISTS'); ws_lists.sheet_state='hidden'
+    types=["numeric","percent","date","email","url","categorical","free_text","id"]
+    priorities=["LOW","MEDIUM","HIGH","VERY_HIGH"]
+    yesno=["YES","NO"]
+    for i,v in enumerate(types,1): ws_lists.cell(row=i, column=1, value=v)
+    for i,v in enumerate(priorities,1): ws_lists.cell(row=i, column=2, value=v)
+    for i,v in enumerate(yesno,1): ws_lists.cell(row=i, column=3, value=v)
+    for i,v in enumerate(df_columns,1): ws_lists.cell(row=i, column=4, value=str(v))
+    headers=[str(c).strip().lower() for c in cfg_df.columns]
+    def col_idx(name): return headers.index(name)+1 if name in headers else None
+    n_rows=len(cfg_df)+1
+    dv_type=DataValidation(type="list", formula1="=LISTS!$A$1:$A$8", allow_blank=True)
+    dv_pri=DataValidation(type="list", formula1="=LISTS!$B$1:$B$4", allow_blank=True)
+    dv_yesno=DataValidation(type="list", formula1="=LISTS!$C$1:$C$2", allow_blank=True)
+    dv_headers=DataValidation(type="list", formula1=f"=LISTS!$D$1:$D${len(df_columns)}", allow_blank=True)
+    for dv in (dv_type,dv_pri,dv_yesno,dv_headers): ws_cfg.add_data_validation(dv)
+    def apply_range(col_name, dv):
+        c=col_idx(col_name); 
+        if not c: return
+        dv.add(f"{get_column_letter(c)}2:{get_column_letter(c)}{n_rows}")
     apply_range('type', dv_type)
-    apply_range('priority', dv_priority)
+    apply_range('priority', dv_pri)
     apply_range('active', dv_yesno)
     apply_range('highlight_nulls', dv_yesno)
     apply_range('include_null_in_email', dv_yesno)
-
-    # Emails row validations
     import pandas as _pd
-    mask_emails = _pd.Series([str(x).strip().lower() for x in cfg_df['column']]).eq('emails')
+    mask_emails=_pd.Series([str(x).strip().lower() for x in cfg_df['column']]).eq('emails')
     if mask_emails.any():
-        r = cfg_df.index[mask_emails][0] + 2
-        # Emails.active
-        c = col_idx('active');
+        r=cfg_df.index[mask_emails][0]+2
+        c=col_idx('active');           
         if c: dv_yesno.add(f"{get_column_letter(c)}{r}")
-        # Emails.domain -> dataset headers
-        c = col_idx('domain');
+        c=col_idx('domain');           
         if c: dv_headers.add(f"{get_column_letter(c)}{r}")
-        # Emails.email_severity_threshold (HIGH, VERY_HIGH)
         if 'email_severity_threshold' in headers:
-            dv_thr = DataValidation(type="list", formula1='"HIGH,VERY_HIGH"', allow_blank=True)
+            dv_thr=DataValidation(type="list", formula1='"HIGH,VERY_HIGH"', allow_blank=True)
             ws_cfg.add_data_validation(dv_thr)
-            c = col_idx('email_severity_threshold')
+            c=col_idx('email_severity_threshold');
             if c: dv_thr.add(f"{get_column_letter(c)}{r}")
-        # Emails.email_summary YES/NO
         if 'email_summary' in headers:
-            c = col_idx('email_summary');
+            c=col_idx('email_summary');
             if c: dv_yesno.add(f"{get_column_letter(c)}{r}")
-        # Emails.email_recipients_column -> dataset headers
         if 'email_recipients_column' in headers:
-            c = col_idx('email_recipients_column')
+            c=col_idx('email_recipients_column')
             if c: dv_headers.add(f"{get_column_letter(c)}{r}")
 
 
 def generate_simple_config(input_path: Path, df: pd.DataFrame, out_path: Path,
                            coverage_target: float, future_days: int, used_sheet: Optional[str]) -> None:
-    rows = []
+    rows=[]
     for col in df.columns:
-        kind = infer_kind(df[col])
-        min_p = ''; max_p = ''; domain_vals = ''; regex = ''
+        kind=infer_kind(df[col]); min_p=''; max_p=''; domain_vals=''; regex=''
         if kind in ('numeric','percent'):
             x = pd.to_numeric(df[col].astype(str).str.replace('%','',regex=False), errors='coerce')
             if x.notna().any():
-                try:
-                    min_p = float(x.quantile(0.01))
-                    max_p = float(x.quantile(0.99))
-                except Exception:
-                    min_p = ''; max_p = ''
-        elif kind == 'date':
+                try: min_p=float(x.quantile(0.01)); max_p=float(x.quantile(0.99))
+                except Exception: min_p=''; max_p=''
+        elif kind=='date':
             x = pd.to_datetime(df[col], errors='coerce', dayfirst=True)
             if x.notna().any():
-                try:
-                    min_p = x.quantile(0.01).date().isoformat()
-                    max_p = x.quantile(0.99).date().isoformat()
-                except Exception:
-                    min_p = ''; max_p = ''
-        elif kind == 'categorical':
+                try: min_p=x.quantile(0.01).date().isoformat(); max_p=x.quantile(0.99).date().isoformat()
+                except Exception: min_p=''; max_p=''
+        elif kind=='categorical':
             vc = df[col].astype(str).value_counts(dropna=True)
-            if len(vc) > 0:
-                domain_vals = ",".join(map(str, vc.head(15).index.tolist()))
-        rows.append({
-            'column': col,
-            'type': kind,
-            'min': min_p,
-            'max': max_p,
-            'domain': domain_vals,
-            'regex': regex,
-            'priority': 'MEDIUM',
-            'active': 'YES',
-            'highlight_nulls': 'YES',
-            'include_null_in_email': 'NO',
-        })
-
-    # Control rows
-    rows.append({'column':'Emails','type':'meta','min':'','max':'','domain':'',  # default blank to force selection
-                 'regex':'','priority':'','active':'NO','highlight_nulls':'','include_null_in_email':'',})
+            if len(vc)>0: domain_vals=",".join(map(str, vc.head(15).index.tolist()))
+        rows.append({'column':col,'type':kind,'min':min_p,'max':max_p,'domain':domain_vals,'regex':regex,
+                     'priority':'MEDIUM','active':'YES','highlight_nulls':'YES','include_null_in_email':'NO'})
+    rows.append({'column':'Emails','type':'meta','min':'','max':'','domain':'','regex':'','priority':'','active':'NO','highlight_nulls':'','include_null_in_email':'',})
     rows.append({'column':'Main ID','type':'meta','min':'','max':'','domain':detect_main_id(df),'regex':'','priority':'','active':'','highlight_nulls':'','include_null_in_email':'',})
-
-    cfg = pd.DataFrame(rows, columns=CONFIG_COLUMNS)
-
-    # V0.5.1 Emails controls
+    cfg=pd.DataFrame(rows, columns=CONFIG_COLUMNS)
     for c in ('email_severity_threshold','email_summary','email_recipients_column'):
-        if c not in cfg.columns:
-            cfg[c] = ''
-    idx_emails = cfg.index[cfg['column'].astype(str).str.lower().eq('emails')]
-    if len(idx_emails) > 0:
-        i = idx_emails[0]
-        cfg.at[i, 'email_severity_threshold'] = 'HIGH'
-        cfg.at[i, 'email_summary'] = 'YES'
-        cfg.at[i, 'email_recipients_column'] = ''
-
+        if c not in cfg.columns: cfg[c]=''
+    idx = cfg.index[cfg['column'].astype(str).str.lower().eq('emails')]
+    if len(idx)>0:
+        i=idx[0]; cfg.at[i,'email_severity_threshold']='HIGH'; cfg.at[i,'email_summary']='YES'; cfg.at[i,'email_recipients_column']=''
     with pd.ExcelWriter(out_path, engine='openpyxl') as w:
         cfg.to_excel(w, index=False, sheet_name='CONFIG')
-        meta_df = pd.DataFrame({
-            'key': ['input_file','input_sheet','coverage_target','future_days','generated_on','rows','cols'],
-            'value': [str(input_path.name), (used_sheet or ''), coverage_target, future_days, datetime.now().isoformat(), len(df), df.shape[1]]
-        })
+        meta_df=pd.DataFrame({'key':['input_file','input_sheet','coverage_target','future_days','generated_on','rows','cols'],
+                              'value':[str(input_path.name),(used_sheet or ''),coverage_target,future_days,datetime.now().isoformat(),len(df),df.shape[1]]})
         meta_df.to_excel(w, index=False, sheet_name='META')
-
         ws_help = w.book.create_sheet('HELP')
-        for r, line in enumerate(_help_text(), start=1):
-            ws_help.cell(row=r, column=1, value=line)
-
+        for r, line in enumerate(_help_text(), start=1): ws_help.cell(row=r, column=1, value=line)
         apply_config_validations(w, cfg_df=cfg, df_columns=list(df.columns))
 
 
@@ -793,192 +716,94 @@ def read_simple_config(cfg_path: Path) -> Tuple[pd.DataFrame, dict]:
     return cfg.copy(), {'has_meta': 'META' in xl.sheet_names}
 
 # =======================
-# Export report (Excel coloring)
-# =======================
-
-def export_excel(df_raw: pd.DataFrame, sev_df: pd.DataFrame, out_path: Path,
-                 summary_extra: Dict[str, str], main_id_name: str) -> None:
-    out_dir = out_path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    with pd.ExcelWriter(out_path, engine='openpyxl') as w:
-        summary_rows = {'metric': [], 'value': []}
-        for k, v in {
-            'rows': len(df_raw),
-            'columns': df_raw.shape[1],
-            **summary_extra,
-        }.items():
-            summary_rows['metric'].append(k)
-            summary_rows['value'].append(v)
-        pd.DataFrame(summary_rows).to_excel(w, index=False, sheet_name='Summary')
-
-        df_raw.to_excel(w, index=False, sheet_name='Dataset')
-        pd.DataFrame({'key': ['main_id'], 'value': [main_id_name]}).to_excel(w, index=False, sheet_name='Main_ID')
-
-        ws = w.sheets['Dataset']
-        FILLS = {
-            1: PatternFill(fill_type='solid', fgColor='FFF2CC'),
-            2: PatternFill(fill_type='solid', fgColor='FCE4D6'),
-            3: PatternFill(fill_type='solid', fgColor='F8CBAD'),
-            4: PatternFill(fill_type='solid', fgColor='C00000'),
-        }
-        WHITE_FONT = Font(color='FFFFFF')
-
-        n_rows, n_cols = df_raw.shape
-        for r in range(n_rows):
-            for c in range(n_cols):
-                sev = int(sev_df.iat[r, c])
-                if sev > 0:
-                    cell = ws.cell(row=r + 2, column=c + 1)
-                    cell.fill = FILLS.get(sev)
-                    if sev == 4:
-                        cell.font = WHITE_FONT
-
-# =======================
-# Email generation
+# Email generation (kept from V0.5.1)
 # =======================
 
 def extract_emails(text: str) -> List[str]:
-    if not isinstance(text, str) or not text:
-        return []
-    pat = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+    if not isinstance(text,str) or not text: return []
+    pat=re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
     return pat.findall(text)
-
 
 def html_pill(label: str, bg="#eef2ff", fg="#1f2a6b") -> str:
     return f'<span style="display:inline-block;padding:2px 6px;border-radius:10px;background:{bg};color:{fg};font-size:12px;">{label}</span>'
 
-
 def html_escape(s: str) -> str:
-    return (str(s)
-            .replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
-            .replace('"', '&quot;').replace("'", "&#39;"))
+    return (str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'","&#39;"))
 
+from typing import Iterable
 
 def build_row_issue_summary_for_email(df: pd.DataFrame, sev_df: pd.DataFrame, id_col: str,
                                        include_null_cols: Set[str], threshold_num: int) -> pd.DataFrame:
     if id_col in df.columns:
-        id_series = df[id_col].astype(str)
-        id_name = id_col
+        id_series = df[id_col].astype(str); id_name = id_col
     else:
-        id_series = pd.Series([str(i) for i in df.index], index=df.index, name='row_id')
-        id_name = 'row_id'
-
-    # Missing fields only for columns flagged include_null_in_email
+        id_series = pd.Series([str(i) for i in df.index], index=df.index, name='row_id'); id_name='row_id'
     include_cols = [c for c in df.columns if c in include_null_cols]
-    missing_cols_list = []
     if include_cols:
         is_null_df = df[include_cols].isna()
-        for i in df.index:
-            miss_cols = is_null_df.columns[is_null_df.loc[i]].tolist()
-            missing_cols_list.append(", ".join(map(str, miss_cols)))
+        missing_cols_list = [", ".join(is_null_df.columns[is_null_df.loc[i]].tolist()) for i in df.index]
     else:
         missing_cols_list = ["" for _ in df.index]
-
-    sev_num = sev_df.to_numpy()
-    count_high = (sev_num == 3).sum(axis=1)
-    count_vhigh = (sev_num == 4).sum(axis=1)
-
-    # IssueColumns (columns with severity >= threshold)
-    hv_cols: List[str] = []
-    cols = list(sev_df.columns)
-    thr = max(3, threshold_num)
+    sev_num = sev_df.to_numpy(); cols = list(sev_df.columns); thr=max(3,threshold_num)
+    count_high = (sev_num==3).sum(axis=1); count_vhigh=(sev_num==4).sum(axis=1)
+    hv_cols=[]
     for i in range(sev_num.shape[0]):
-        idx = np.where(sev_num[i, :] >= thr)[0]
+        idx = np.where(sev_num[i,:] >= thr)[0]
         names = [cols[j] for j in idx]
-        # Keep it short: show up to 6 columns, then +n more
-        if len(names) > 6:
-            hv_cols.append(", ".join(names[:6]) + f" (+{len(names)-6} more)")
-        else:
-            hv_cols.append(", ".join(names))
-
-    return pd.DataFrame({
-        id_name: id_series.values,
-        'MissingFields': missing_cols_list,
-        'IssueColumns': hv_cols,
-        'Count_HIGH': count_high,
-        'Count_VHIGH': count_vhigh,
-    }, index=df.index)
+        hv_cols.append(", ".join(names[:6]) + (f" (+{len(names)-6} more)" if len(names)>6 else ""))
+    return pd.DataFrame({ id_name: id_series.values, 'MissingFields': missing_cols_list, 'IssueColumns': hv_cols,
+                          'Count_HIGH': count_high, 'Count_VHIGH': count_vhigh }, index=df.index)
 
 
 def _auto_pick_group_col(df: pd.DataFrame) -> Optional[str]:
-    # 1) 'Contact' if present
-    if 'Contact' in df.columns:
-        return 'Contact'
-    # 2) first column with decent email density
+    if 'Contact' in df.columns: return 'Contact'
     for c in df.columns:
         ser = df[c].astype(str).fillna('')
-        if ser.apply(lambda x: len(extract_emails(x)) > 0).mean() >= 0.2:
-            return c
-    # 3) first categorical-looking column (<= 50 unique over sample)
+        if ser.apply(lambda x: len(extract_emails(x))>0).mean() >= 0.2: return c
     for c in df.columns:
         nunique = df[c].nunique(dropna=True)
-        if nunique > 1 and nunique <= 50:
-            return c
+        if 1 < nunique <= 50: return c
     return None
 
 
 def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_id: str,
                     out_dir: Path, default_contact_col: str = 'Contact', cfg_rules: Dict[str, dict] = None) -> None:
-    if not control or not control.get('generate', False):
-        return
-
+    if not control or not control.get('generate', False): return
     group_col_name = (control.get('group_col','') or '').strip()
     if not group_col_name:
         fallback = _auto_pick_group_col(df)
         if fallback:
-            print(f"[Emails] 'domain' was empty. Auto-picking group column: '{fallback}'.")
-            group_col_name = fallback
+            print(f"[Emails] 'domain' was empty. Auto-picking group column: '{fallback}'."); group_col_name = fallback
         else:
-            print("[Emails] 'domain' is empty and no suitable column found. Skipping email generation.")
-            return
-
-    # Resolve group-by column
+            print("[Emails] 'domain' is empty and no suitable column found. Skipping email generation."); return
     col_map = {str(c).strip(): c for c in df.columns}
     col_lower_map = {str(c).strip().lower(): c for c in df.columns}
     resolved_group_col = col_map.get(group_col_name) or col_lower_map.get(group_col_name.lower())
     if not resolved_group_col:
         fallback = _auto_pick_group_col(df)
         if fallback:
-            print(f"[Emails] Group-by column '{group_col_name}' not found. Auto-picking '{fallback}'.")
-            resolved_group_col = fallback
+            print(f"[Emails] Group-by column '{group_col_name}' not found. Auto-picking '{fallback}'."); resolved_group_col = fallback
         else:
-            print(f"[Emails] Group-by column '{group_col_name}' not found. Skipping.")
-            return
-
-    # Threshold & summary
-    thr_label = (control.get('email_severity_threshold','HIGH') or 'HIGH').strip().upper()
-    thr_num = CRIT_TO_NUM.get(thr_label, 3)
-    email_summary_enabled = bool(control.get('email_summary', True))
-
-    # Determine which columns' NULLs should be shown in emails
+            print(f"[Emails] Group-by column '{group_col_name}' not found. Skipping."); return
+    thr_label = (control.get('email_severity_threshold','HIGH') or 'HIGH').strip().upper(); thr_num = CRIT_TO_NUM.get(thr_label,3)
     include_null_cols: Set[str] = set()
     if cfg_rules:
-        for col, rule in cfg_rules.items():
+        for col,rule in cfg_rules.items():
             try:
-                if rule.get('include_null_in_email', False):
-                    include_null_cols.add(col)
-            except Exception:
-                pass
-
-    # Determine recipients column preference
+                if rule.get('include_null_in_email', False): include_null_cols.add(col)
+            except Exception: pass
     recipients_pref = (control.get('email_recipients_column','') or '').strip()
-
     series_grp = df[resolved_group_col].astype(str).fillna('')
     email_like_ratio = series_grp.apply(lambda x: len(extract_emails(x))>0).mean() if len(series_grp) else 0.0
-
-    # Build grouping
     if email_like_ratio >= 0.2:
         email_to_indices: Dict[str, List[int]] = {}
         for i, cell in df[resolved_group_col].fillna('').astype(str).items():
             for em in (e.lower() for e in extract_emails(cell)):
                 email_to_indices.setdefault(em, []).append(i)
-        grouping = email_to_indices
-        contact_col = resolved_group_col
+        grouping = email_to_indices; contact_col = resolved_group_col
     else:
         groups = df[resolved_group_col].fillna('(no value)')
         grouping = {g: df.index[groups==g] for g in groups.unique()}
-        # Determine recipients column in priority order: explicit -> default Contact -> auto-detect
         contact_col = None
         if recipients_pref and recipients_pref in df.columns:
             contact_col = recipients_pref
@@ -987,81 +812,43 @@ def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_
         else:
             for c in df.columns:
                 ser = df[c].astype(str).fillna('')
-                if ser.apply(lambda x: len(extract_emails(x)) > 0).mean() >= 0.1:
-                    contact_col = c; print(f"[Emails] Using column '{contact_col}' for recipients.")
-                    break
+                if ser.apply(lambda x: len(extract_emails(x))>0).mean() >= 0.1:
+                    contact_col = c; print(f"[Emails] Using column '{contact_col}' for recipients."); break
         if not contact_col:
             print("[Emails] No column with emails found for recipients. Drafts will be saved without 'To:'.")
-
-    # Outlook
-    outlook = None
+    outlook=None
     try:
         import win32com.client  # type: ignore
         outlook = win32com.client.Dispatch("Outlook.Application")
     except Exception:
-        outlook = None
-        print("[Emails] Outlook/pywin32 not available. Will save .html instead of .msg.")
-
+        outlook=None; print("[Emails] Outlook/pywin32 not available. Will save .html instead of .msg.")
     out_dir.mkdir(parents=True, exist_ok=True)
-    extra_to = (control.get('email_to','') or '').strip()
-    generated = 0
-
-    row_summary_all = build_row_issue_summary_for_email(df, sev_df, id_col=main_id,
-                                                        include_null_cols=include_null_cols, threshold_num=thr_num)
-
+    extra_to = (control.get('email_to','') or '').strip(); generated=0
+    row_summary_all = build_row_issue_summary_for_email(df, sev_df, id_col=main_id, include_null_cols=include_null_cols, threshold_num=thr_num)
     for key, idxs in grouping.items():
-        if len(idxs) == 0:
-            continue
-        sub = df.loc[idxs]
-        sub_sum = row_summary_all.loc[idxs]
-
+        if len(idxs)==0: continue
+        sub = df.loc[idxs]; sub_sum = row_summary_all.loc[idxs]
         has_hv = (sub_sum[['Count_HIGH','Count_VHIGH']].sum(axis=1) > 0)
         has_miss = sub_sum['MissingFields'].astype(str).str.len() > 0
         show = sub_sum[has_hv | has_miss]
-        if show.empty:
-            continue
-
-        # Recipients
-        to_list: List[str] = []
-        if extra_to:
-            to_list.extend(extract_emails(extra_to))
+        if show.empty: continue
+        to_list=[]
+        if extra_to: to_list.extend(extract_emails(extra_to))
         if recipients_pref and recipients_pref in sub.columns:
-            for val in sub[recipients_pref].dropna().astype(str):
-                to_list.extend(extract_emails(val))
+            for val in sub[recipients_pref].dropna().astype(str): to_list.extend(extract_emails(val))
         elif contact_col and contact_col in sub.columns:
-            for val in sub[contact_col].dropna().astype(str):
-                to_list.extend(extract_emails(val))
+            for val in sub[contact_col].dropna().astype(str): to_list.extend(extract_emails(val))
         if email_like_ratio >= 0.2:
-            if isinstance(key, str) and key:
-                to_list.append(key)
+            if isinstance(key,str) and key: to_list.append(key)
         to_list = sorted({e for e in to_list if e})
-
-        # Optional Summary block
-        summary_lines = []
-        # Buildings reviewed
-        building_cols = [c for c in sub.columns if 'building' in str(c).lower()]
-        if building_cols:
-            try:
-                summary_lines.append(f"• Buildings reviewed: {int(sub[building_cols[0]].nunique(dropna=True))}")
-            except Exception:
-                pass
-        # With missing fields (email-worthy only)
-        if include_null_cols:
-            try:
-                summary_lines.append(f"• With missing fields: {int(sub[list(include_null_cols)].isna().any(axis=1).sum())}")
-            except Exception:
-                pass
-
-        # HTML body
-        rows_html: List[str] = []
-        id_header = html_escape(main_id) if main_id in df.columns else 'Row ID'
+        rows_html=[]; id_header = html_escape(main_id) if main_id in df.columns else 'Row ID'
         for _, r in show.iterrows():
             id_val = html_escape(r[main_id]) if main_id in show.columns else html_escape(r.name)
             miss = html_escape(r['MissingFields']) if r['MissingFields'] else '<em>—</em>'
             issues = html_escape(r['IssueColumns']) if r['IssueColumns'] else '<em>—</em>'
-            pills = []
-            if int(r['Count_VHIGH']) > 0: pills.append(html_pill(f"VHIGH {int(r['Count_VHIGH'])}", "#ffe3e6", "#86181d"))
-            if int(r['Count_HIGH'])  > 0: pills.append(html_pill(f"HIGH {int(r['Count_HIGH'])}",  "#f8d7da", "#721c24"))
+            pills=[]
+            if int(r['Count_VHIGH'])>0: pills.append(html_pill(f"VHIGH {int(r['Count_VHIGH'])}", "#ffe3e6", "#86181d"))
+            if int(r['Count_HIGH'])>0: pills.append(html_pill(f"HIGH {int(r['Count_HIGH'])}",  "#f8d7da", "#721c24"))
             rows_html.append(f"""
             <tr style=\"border-bottom:1px solid #eaeaea;\">
               <td style=\"padding:6px 8px; white-space:nowrap;\">{id_val}</td>
@@ -1070,19 +857,12 @@ def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_
               <td style=\"padding:6px 8px;\">{' '.join(pills) if pills else html_pill('—')}</td>
             </tr>
             """)
-
-        label = key if isinstance(key, str) else str(key)
+        label = key if isinstance(key,str) else str(key)
         subject = f"[Data QA] Items to review — Group: {label}"
-
-        summary_html = ""
-        if control.get('email_summary', True) and summary_lines:
-            summary_html = "<p><b>Summary</b><br/>" + "<br/>".join(map(html_escape, summary_lines)) + "</p>"
-
         body_html = f"""
         <html><body style="font-family:Segoe UI, Arial, sans-serif; font-size:13px;">
         <p>Hello,</p>
         <p>Please find the items detected for <b>{html_escape(label)}</b>. This draft includes only HIGH/VERY_HIGH issues and selected missing fields.</p>
-        {summary_html}
         <table style="border-collapse:collapse; width:100%; margin-top:8px;">
           <thead>
             <tr style="background:#f0f3f6; border-bottom:1px solid #d0d7de;">
@@ -1097,36 +877,26 @@ def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_
         <p style="margin-top:12px;">Thanks,<br/>Daniel</p>
         </body></html>
         """
-
         safe = re.sub(r"[^A-Za-z0-9._\- ]+", "_", label)[:100]
         if outlook is not None:
             try:
-                mail = outlook.CreateItem(0)
-                mail.Subject = subject
-                if to_list:
-                    mail.To = '; '.join(to_list)
+                mail = outlook.CreateItem(0); mail.Subject = subject
+                if to_list: mail.To = '; '.join(to_list)
                 mail.HTMLBody = body_html
-                msg_path = out_dir / f"QA_group_{safe}.msg"
-                mail.SaveAs(str(msg_path), 3)
-                print(f"Saved MSG -> {msg_path.name} To={mail.To or '(none)'}")
-                generated += 1
-                continue
+                msg_path = out_dir / f"QA_group_{safe}.msg"; mail.SaveAs(str(msg_path), 3)
+                print(f"Saved MSG -> {msg_path.name} To={mail.To or '(none)'}"); generated += 1; continue
             except Exception as e:
                 print(f"Could not save .msg, falling back to .html. Details: {e}")
-        html_path = out_dir / f"QA_group_{safe}.html"
-        with open(html_path, 'w', encoding='utf-8') as f:
-            f.write(body_html)
-        print(f"Saved HTML -> {html_path.name} Suggested To={', '.join(to_list) if to_list else '-'}")
-        generated += 1
-
+        html_path = out_dir / f"QA_group_{safe}.html"; open(html_path,'w',encoding='utf-8').write(body_html)
+        print(f"Saved HTML -> {html_path.name} Suggested To={', '.join(to_list) if to_list else '-'}"); generated += 1
     print(f"Email drafts generated: {generated}")
 
 # =======================
-# MAIN
+# MAIN with --debug
 # =======================
 
 def main():
-    ap = argparse.ArgumentParser(description='Universal CSV/Excel Analyzer (EN V0.5.1) — simple config (no sending)')
+    ap = argparse.ArgumentParser(description='Universal CSV/Excel Analyzer (EN V0.5.2) — simple config (no sending)')
     ap.add_argument('-i','--input', help='Path to CSV/TSV/Excel (if omitted, opens a file picker)')
     ap.add_argument('-o','--out', help='Output Excel path (default initial/final next to input)')
     ap.add_argument('--config', help='Path to config_[input].xlsx (if omitted, autodetects)')
@@ -1136,23 +906,19 @@ def main():
     ap.add_argument('--coverage', type=float, default=0.95, help='Coverage for categorical coherence (default 0.95)')
     ap.add_argument('--future-days', type=int, default=730, help='Allowed future window for dates (days, default 730)')
     ap.add_argument('--id-col', default='', help='Main ID column (if known)')
+    ap.add_argument('--debug', action='store_true', help='Export extra diagnostics and print parsed limits per column')
     args = ap.parse_args()
 
     if args.input:
         input_path = Path(args.input)
-        if not input_path.exists():
-            print(f"File does not exist: {input_path}")
-            return
+        if not input_path.exists(): print(f"File does not exist: {input_path}"); return
     else:
-        input_path = pick_file_dialog()
-        if not input_path:
-            print('Operation cancelled.'); return
+        input_path = pick_file_dialog(); 
+        if not input_path: print('Operation cancelled.'); return
 
     if not args.config:
         auto_cfg = input_path.with_name(f"config_{input_path.stem}.xlsx")
-        if auto_cfg.exists():
-            print(f"Config detected: {auto_cfg.name} — FINAL phase")
-            args.config = str(auto_cfg)
+        if auto_cfg.exists(): print(f"Config detected: {auto_cfg.name} — FINAL phase"); args.config = str(auto_cfg)
 
     df, meta = smart_read_any(input_path, forced_encoding=args.encoding, forced_sep=args.sep, input_sheet=args.input_sheet)
     used_sheet = meta.get('sheet') if isinstance(meta.get('sep',''),str) and str(meta.get('sep','')).startswith('excel:') else None
@@ -1161,34 +927,65 @@ def main():
     main_id = args.id_col.strip() or ''
 
     if args.config:
-        cfg_path = Path(args.config)
-        cfg_df, _ = read_simple_config(cfg_path)
-        sev_df, rule_map, control = build_severity_simple(df, cfg_df, coverage_target=args.coverage, future_days=args.future_days, main_id_col=main_id)
+        cfg_path = Path(args.config); cfg_df, _ = read_simple_config(cfg_path)
+        rules_dump: List[dict] = []
+        sev_df, rule_map, control = build_severity_simple(df, cfg_df, coverage_target=args.coverage, future_days=args.future_days, main_id_col=main_id, debug=args.debug, rules_dump=rules_dump)
+        if args.debug:
+            # Print parsed limits summary for columns with rules
+            for rec in rules_dump:
+                if rec['min'] is not None or rec['max'] is not None:
+                    print(f"[DEBUG] {rec['column']} type={rec['type']} min={rec['min']} max={rec['max']} sev_counts(L/M/H/VH)={rec.get('count_LOW',0)}/{rec.get('count_MED',0)}/{rec.get('count_HIGH',0)}/{rec.get('count_VHIGH',0)}")
+            # Export Rules_Applied sheet and per-column samplers
+        rules_applied_df = pd.DataFrame(rules_dump) if rules_dump else None
         if not main_id:
-            forced = control.get('main_id_forced','')
-            if forced and forced in df.columns:
-                main_id = forced
-        if not main_id:
-            main_id = detect_main_id(df)
+            forced = control.get('main_id_forced','');
+            if forced and forced in df.columns: main_id = forced
+        if not main_id: main_id = detect_main_id(df)
         ts = datetime.now().strftime('%Y%m%d_%H%M')
         out_xlsx = Path(args.out) if args.out else input_path.with_name(f"final_report_{input_path.stem}_{ts}.xlsx")
-        extra = {'phase': 'FINAL', 'input_sheet': used_sheet or '', 'main_id': main_id, 'config_file': Path(args.config).name}
-        export_excel(df, sev_df, out_xlsx, extra, main_id)
+        extra={'phase':'FINAL','input_sheet': used_sheet or '', 'main_id': main_id, 'config_file': Path(args.config).name}
+        export_excel(df, sev_df, out_xlsx, extra, main_id, rules_applied=rules_applied_df)
         print(f"Final report -> {out_xlsx}")
+        if args.debug:
+            # Create per-column samplers for those with numeric/percent/date limits
+            diag_dir = out_xlsx.parent / f"QA_DIAG_{input_path.stem}_{ts}"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            for rec in rules_dump or []:
+                if rec['type'] in ('numeric','percent','date') and (rec['min'] is not None or rec['max'] is not None):
+                    col = rec['column']
+                    try:
+                        sampler = df[[col]].copy()
+                        if rec['type']=='numeric':
+                            sampler['parsed'] = pd.to_numeric(sampler[col].apply(lambda v: clean_numeric_string(str(v)) if pd.notna(v) else v), errors='coerce')
+                            lo, hi = rec['min'], rec['max']
+                            sampler['below_min'] = sampler['parsed'] < lo if lo is not None else False
+                            sampler['above_max'] = sampler['parsed'] > hi if hi is not None else False
+                        elif rec['type']=='percent':
+                            sampler['parsed'] = pd.to_numeric(sampler[col].astype(str).str.replace('%','', regex=False).apply(clean_numeric_string), errors='coerce')
+                            lo = 0.0 if rec['min'] is None else rec['min']
+                            hi = 100.0 if rec['max'] is None else rec['max']
+                            sampler['out_of_range'] = (sampler['parsed'] < lo) | (sampler['parsed'] > hi)
+                        elif rec['type']=='date':
+                            sampler['parsed'] = pd.to_datetime(sampler[col], errors='coerce', dayfirst=True)
+                            from_dt = pd.to_datetime(rec['min']) if rec['min'] else pd.Timestamp('1900-01-01')
+                            to_dt = pd.to_datetime(rec['max']) if rec['max'] else pd.Timestamp.today()
+                            sampler['out_of_bounds'] = (sampler['parsed'] < from_dt) | (sampler['parsed'] > to_dt)
+                        sampler.head(5000).to_excel(diag_dir / f"{col[:60]}_diag.xlsx", index=False)
+                    except Exception:
+                        pass
+            print(f"[DEBUG] Diagnostics saved -> {diag_dir}")
         generate_emails(df, sev_df, control=control, main_id=main_id, out_dir=out_xlsx.parent, cfg_rules=rule_map)
         return
 
     # Phase 1
-    if not main_id:
-        main_id = detect_main_id(df)
+    if not main_id: main_id = detect_main_id(df)
     tmp_cfg = pd.DataFrame([{ 'column': c, 'type': infer_kind(df[c]), 'min':'', 'max':'', 'domain':'', 'regex':'', 'priority':'MEDIUM', 'active':'YES', 'highlight_nulls':'YES', 'include_null_in_email':'NO' } for c in df.columns])
-    sev_df, _, _ = build_severity_simple(df, tmp_cfg, coverage_target=args.coverage, future_days=args.future_days, main_id_col=main_id)
+    sev_df, _, _ = build_severity_simple(df, tmp_cfg, coverage_target=args.coverage, future_days=args.future_days, main_id_col=main_id, debug=args.debug, rules_dump=None)
     ts = datetime.now().strftime('%Y%m%d_%H%M')
     out_xlsx = Path(args.out) if args.out else input_path.with_name(f"initial_report_{input_path.stem}_{ts}.xlsx")
-    extra = {'phase': 'INITIAL', 'input_sheet': used_sheet or '', 'main_id': main_id}
+    extra={'phase':'INITIAL','input_sheet': used_sheet or '', 'main_id': main_id}
     export_excel(df, sev_df, out_xlsx, extra, main_id)
     print(f"Initial report -> {out_xlsx}")
-
     cfg_out = input_path.with_name(f"config_{input_path.stem}.xlsx")
     generate_simple_config(input_path, df, cfg_out, coverage_target=args.coverage, future_days=args.future_days, used_sheet=used_sheet)
     print("Simple config -> {}".format(cfg_out))
