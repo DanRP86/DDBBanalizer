@@ -2,21 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-Universal CSV/Excel Analyzer — Simple Config (V0.4c)
+Universal CSV/Excel Analyzer — Simple Config (V0.4d)
 ----------------------------------------------------
-- 1 sola hoja de CONFIG (simple) para usuarios no técnicos.
-- Fase 1 (sin config): initial_report + config_SIMPLE.
-- Fase 2 (con config autodetectado): final_report + generación de emails por cualquier CAMPO indicado en la fila de control.
-- Emails: NUNCA se envían; se guardan como .MSG (si Outlook disponible) o .HTML como fallback.
-- Fila de control (última) minimalista:
-    - columna='__CONTROL__'
-    - tipo='meta'
-    - min_propuesto -> emails adicionales en To: (opcional)
-    - dominio -> **nombre de la columna por la que agrupar** (ej.: Country, Landlord Name, Product Line, Contact...)
-    - activo -> 'SI' para activar la generación de emails
-    - (max_propuesto se ignora para el agrupado; se mantiene por back-compat y puede contener 'email/pais/campo')
+CAMBIOS CLAVE EN V0.4d
+- Fila de control renombrada a:  **Emails**  (antes __CONTROL__).
+- En la hoja CONFIG, justo DEBAJO de "Emails" aparece una fila **Main ID** para forzar el identificador principal.
+- Agrupación UNIVERSAL por la columna indicada en `Emails.dominio`: Country, Landlord, Product Line, Contact, etc.
+  • Si esa columna contiene emails → un email por dirección.
+  • Si no contiene emails → un email por cada valor de esa columna; destinatarios obtenidos de `Contact` o columna con emails detectada.
+- Corrección error pandas: `if len(idxs) == 0` en lugar de `if not idxs`.
+- Fechas en config: evita warnings con `%Y-%m-%d` detectando formato ISO y usando `dayfirst=False` sólo cuando aplica.
+- NUNCA se envían emails automáticamente: se guardan `.msg` (Outlook si disponible) o `.html` como fallback.
 
-Requisitos: pandas, numpy, openpyxl (y opcionalmente pywin32 para .MSG)
+Requisitos: pandas, numpy, openpyxl (pywin32 opcional para .msg)
 """
 
 import argparse
@@ -108,8 +106,8 @@ def smart_read_csv_with_guess(path: Path, forced_encoding: Optional[str] = None,
         return df, {"encoding": enc, "sep": sep, "forced": True}
     with open(path, "rb") as f: raw = f.read(200_000)
     encodings_to_try = []
-    bom = detect_bom_encoding(raw)
-    if bom: encodings_to_try.append(bom)
+    from_bom = detect_bom_encoding(raw)
+    if from_bom: encodings_to_try.append(from_bom)
     encodings_to_try += ["utf-8", "utf-8-sig", "latin1", "cp1252", "utf-16", "utf-16le", "utf-16be", "utf-32"]
     ch = try_chardet(raw)
     if ch and ch not in encodings_to_try: encodings_to_try.append(ch)
@@ -227,22 +225,58 @@ def apply_base_priority(col_sev_arr: np.ndarray, mask: pd.Series, issue_code: st
     arr_mask = np.where(mask.to_numpy(), num, 0)
     return np.maximum(col_sev_arr, arr_mask)
 
+# parse date values from config avoiding warning with ISO dates
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def parse_cfg_date(val):
+    if val in (None, ""): return None
+    s = str(val).strip()
+    if ISO_DATE_RE.match(s):
+        # ISO yyyy-mm-dd: dayfirst False
+        try:
+            return pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+        except Exception:
+            return pd.to_datetime(s, errors="coerce", dayfirst=False)
+    # Otherwise try with dayfirst True
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
 def build_severity_simple(df: pd.DataFrame, config_rows: pd.DataFrame, coverage_target: float,
                           future_days: int, main_id_col: Optional[str]) -> Tuple[pd.DataFrame, Dict[str, dict], dict]:
     sev = pd.DataFrame(0, index=df.index, columns=df.columns, dtype=np.int8)
     cfg = config_rows.copy(); cfg.columns=[str(c).strip().lower() for c in cfg.columns]
     control = {}
+    main_id_forced = None
     if not cfg.empty and 'columna' in cfg.columns:
-        mask_ctrl = cfg['columna'].astype(str).str.strip().eq('__CONTROL__')
-        if mask_ctrl.any():
-            last = cfg[mask_ctrl].iloc[-1]
+        # ---- Emails row ----
+        mask_emails = cfg['columna'].astype(str).str.strip().str.lower().eq('emails')
+        if mask_emails.any():
+            last = cfg[mask_emails].iloc[-1]
             control = {
                 'email_to': str(last.get('min_propuesto','') or '').strip(),
                 'group_col': str(last.get('dominio','') or '').strip(),
                 'legacy_mode': str(last.get('max_propuesto','') or '').strip().lower(),
                 'generate': parse_bool(last.get('activo','NO'), default=False),
             }
-            cfg = cfg[~mask_ctrl]
+            cfg = cfg[~mask_emails]
+        else:
+            # backward-compat: __CONTROL__
+            mask_ctrl = cfg['columna'].astype(str).str.strip().eq('__CONTROL__')
+            if mask_ctrl.any():
+                last = cfg[mask_ctrl].iloc[-1]
+                control = {
+                    'email_to': str(last.get('min_propuesto','') or '').strip(),
+                    'group_col': str(last.get('dominio','') or '').strip(),
+                    'legacy_mode': str(last.get('max_propuesto','') or '').strip().lower(),
+                    'generate': parse_bool(last.get('activo','NO'), default=False),
+                }
+                cfg = cfg[~mask_ctrl]
+        # ---- Main ID row ----
+        mask_mainid = cfg['columna'].astype(str).str.strip().str.lower().eq('main id')
+        if mask_mainid.any():
+            row = cfg[mask_mainid].iloc[-1]
+            main_id_forced = str(row.get('dominio','') or '').strip()
+            cfg = cfg[~mask_mainid]
+
     rule_map: Dict[str,dict] = {}
     for _, r in cfg.iterrows():
         col = str(r.get('columna','') or '').strip()
@@ -314,8 +348,8 @@ def build_severity_simple(df: pd.DataFrame, config_rows: pd.DataFrame, coverage_
                 parse_fail = s.notna() & x.isna()
                 if parse_fail.any(): col_sev = apply_base_priority(col_sev, parse_fail, 'date_parse_fail', base_pri)
                 if x.notna().any():
-                    lower = pd.Timestamp('1900-01-01') if min_v in (None,'') else pd.to_datetime(min_v, errors='coerce', dayfirst=True)
-                    upper = (pd.Timestamp.today()+pd.Timedelta(days=future_days)) if max_v in (None,'') else pd.to_datetime(max_v, errors='coerce', dayfirst=True)
+                    lower = parse_cfg_date(min_v) if min_v not in (None,'') else pd.Timestamp('1900-01-01')
+                    upper = parse_cfg_date(max_v) if max_v not in (None,'') else (pd.Timestamp.today()+pd.Timedelta(days=future_days))
                     bad = ((x < lower) | (x > upper)) & x.notna()
                     if bad.any(): col_sev = apply_base_priority(col_sev, bad, 'date_out_of_bounds', base_pri)
             elif tipo=='email':
@@ -344,6 +378,8 @@ def build_severity_simple(df: pd.DataFrame, config_rows: pd.DataFrame, coverage_
         except Exception:
             pass
         sev[col]=col_sev.astype(np.int8)
+    # Devuelve main_id_forced dentro de control para usarlo en main
+    if main_id_forced: control['main_id_forced'] = main_id_forced
     return sev, rule_map, control
 
 # =======================
@@ -390,6 +426,11 @@ SIMPLE_CONFIG_COLUMNS = [
 def generate_simple_config(input_path: Path, df: pd.DataFrame, out_path: Path,
                            coverage_target: float, future_days: int, used_sheet: Optional[str]) -> None:
     rows=[]
+    # Infer a candidate Main ID for the meta row
+    def _detect_main_id_local(_df: pd.DataFrame) -> str:
+        return detect_main_id(_df)
+    detected_main_id = _detect_main_id_local(df)
+
     for col in df.columns:
         kind=infer_kind(df[col]); min_p=''; max_p=''; dominio=''; regex=''
         if kind in ('numeric','percent'):
@@ -403,8 +444,12 @@ def generate_simple_config(input_path: Path, df: pd.DataFrame, out_path: Path,
             if len(vc)>0: dominio=",".join(map(str, vc.head(15).index.tolist()))
         rows.append({'columna':col,'tipo':kind,'min_propuesto':min_p,'max_propuesto':max_p,
                      'dominio':dominio,'regex':regex,'prioridad':'MEDIUM','activo':'SI','resaltar_null':'SI'})
-    rows.append({'columna':'__CONTROL__','tipo':'meta','min_propuesto':'','max_propuesto':'email',
+    # Meta rows: Emails y Main ID
+    rows.append({'columna':'Emails','tipo':'meta','min_propuesto':'','max_propuesto':'',
                  'dominio':'Country','regex':'','prioridad':'','activo':'NO','resaltar_null':''})
+    rows.append({'columna':'Main ID','tipo':'meta','min_propuesto':'','max_propuesto':'',
+                 'dominio':detected_main_id,'regex':'','prioridad':'','activo':'','resaltar_null':''})
+
     cfg=pd.DataFrame(rows, columns=SIMPLE_CONFIG_COLUMNS)
     with pd.ExcelWriter(out_path, engine='openpyxl') as w:
         cfg.to_excel(w, index=False, sheet_name='CONFIG')
@@ -468,7 +513,8 @@ def build_row_issue_summary(df: pd.DataFrame, sev_df: pd.DataFrame, id_col: str)
     for i in df.index:
         miss_cols = df.columns[is_null_df.loc[i]].tolist(); missing_cols_list.append(', '.join(map(str, miss_cols)))
     sev_num = sev_df.to_numpy(); low=(sev_num==1).sum(axis=1); med=(sev_num==2).sum(axis=1); high=(sev_num==3).sum(axis=1); vhi=(sev_num==4).sum(axis=1)
-    return pd.DataFrame({ id_series.name: id_series.values, 'MissingFields': missing_cols_list,
+    return pd.DataFrame({ id_series.name: id_series.values,
+                          'MissingFields': missing_cols_list,
                           'Count_LOW': low, 'Count_MED': med, 'Count_HIGH': high, 'Count_VHIGH': vhi }, index=df.index)
 
 def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_id: str,
@@ -476,20 +522,20 @@ def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_
     if not control or not control.get('generate', False): return
     group_col_name = (control.get('group_col','') or '').strip()
     if not group_col_name:
-        print("! __CONTROL__: 'dominio' (columna para agrupar) esta vacio. No se generan emails."); return
+        print("! Emails: 'dominio' (columna para agrupar) esta vacio. No se generan emails."); return
     # Resolver columna por nombre (case-insensitive)
     col_map = {str(c).strip(): c for c in df.columns}
     col_lower_map = {str(c).strip().lower(): c for c in df.columns}
     resolved_group_col = col_map.get(group_col_name) or col_lower_map.get(group_col_name.lower())
     if not resolved_group_col:
-        print(f"! La columna para agrupar '{group_col_name}' no existe en el dataset. No se generan emails."); return
+        print(f"! Emails: la columna para agrupar '{group_col_name}' no existe en el dataset. No se generan emails."); return
 
     series_grp = df[resolved_group_col].astype(str).fillna('')
     email_like_ratio = series_grp.apply(lambda x: len(extract_emails(x))>0).mean() if len(series_grp) else 0.0
 
     # Construir grupos
     if email_like_ratio >= 0.2:
-        # Agrupar por cada email encontrado en esa columna
+        # Agrupar por cada email encontrado en esa columna (Contact, etc.)
         email_to_indices: Dict[str, List[int]] = {}
         for i, cell in df[resolved_group_col].fillna('').astype(str).items():
             for em in (e.lower() for e in extract_emails(cell)):
@@ -506,9 +552,9 @@ def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_
             for c in df.columns:
                 ser = df[c].astype(str).fillna('')
                 if ser.apply(lambda x: len(extract_emails(x))>0).mean() >= 0.1:
-                    contact_col = c; print(f"i Usando columna '{contact_col}' para destinatarios."); break
+                    contact_col = c; print(f"i Emails: usando columna '{contact_col}' para destinatarios."); break
         if not contact_col:
-            print("! No se encontro columna con emails para destinatarios. Se generaran .msg sin 'To:'.")
+            print("! Emails: no se encontro columna con emails para destinatarios. Se generaran .msg sin 'To:'.")
 
     row_issues = build_row_issue_summary(df, sev_df, id_col=main_id)
 
@@ -518,14 +564,16 @@ def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_
         import win32com.client  # type: ignore
         outlook = win32com.client.Dispatch("Outlook.Application")
     except Exception:
-        outlook=None; print("i Outlook/pywin32 no disponible. Se generaran .html.")
+        outlook=None; print("i Emails: Outlook/pywin32 no disponible. Se generaran .html.")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     extra_to = control.get('email_to','').strip()
     generated=0
 
     for key, idxs in grouping.items():
-        if not idxs: continue
+        # idxs puede ser list o pandas.Index
+        if len(idxs) == 0:
+            continue
         sub = df.loc[idxs]
         sub_iss = row_issues.loc[idxs]
         mask_has_missing = sub_iss['MissingFields'].astype(str).str.len()>0
@@ -539,11 +587,11 @@ def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_
         if contact_col and contact_col in sub.columns:
             for val in sub[contact_col].dropna().astype(str): to_list.extend(extract_emails(val))
         if email_like_ratio >= 0.2:
-            # si la agrupacion era por email, el 'key' es el email
+            # si la agrupacion era por email, el 'key' es ese email
             if isinstance(key,str) and key: to_list.append(key)
         to_list = sorted(set([e for e in to_list if e]))
 
-        # HTML
+        # HTML (estilo compacto con pills)
         rows_html=[]
         for _, r in show.iterrows():
             id_val = html_escape(r[main_id]) if main_id in show.columns else html_escape(r.name)
@@ -606,7 +654,7 @@ def generate_emails(df: pd.DataFrame, sev_df: pd.DataFrame, control: dict, main_
 # =======================
 
 def main():
-    ap = argparse.ArgumentParser(description='Universal CSV/Excel Analyzer (V0.4c) — simple config (no envio)')
+    ap = argparse.ArgumentParser(description='Universal CSV/Excel Analyzer (V0.4d) — simple config (no envio)')
     ap.add_argument('-i','--input', help='Ruta a CSV/TSV/Excel (si se omite, abre selector)')
     ap.add_argument('-o','--out', help='Ruta de salida Excel (por defecto initial/final junto al input)')
     ap.add_argument('--config', help='Ruta a config_[input].xlsx (si se omite, autodetecta)')
@@ -643,13 +691,15 @@ def main():
     if args.config:
         cfg_path = Path(args.config)
         cfg_df, _ = read_simple_config(cfg_path)
-        # Si hay tipo=id activo -> fija Main ID
-        id_rows = cfg_df[(cfg_df['tipo'].astype(str).str.lower()=='id') & (cfg_df['activo'].astype(str).str.upper().isin(['SI','TRUE']))]
-        if main_id=='' and not id_rows.empty:
-            candidate = str(id_rows.iloc[0]['columna']).strip()
-            if candidate in df.columns: main_id = candidate
-        if main_id=='': main_id = detect_main_id(df)
         sev_df, _, control = build_severity_simple(df, cfg_df, coverage_target=args.coverage, future_days=args.future_days, main_id_col=main_id)
+        # Forzar Main ID si existe en control
+        if not main_id:
+            forced = control.get('main_id_forced','')
+            if forced and forced in df.columns:
+                main_id = forced
+        if not main_id:
+            # Si aun no hay main_id, detectar
+            main_id = detect_main_id(df)
         ts = datetime.now().strftime('%Y%m%d_%H%M')
         out_xlsx = Path(args.out) if args.out else input_path.with_name(f"final_report_{input_path.stem}_{ts}.xlsx")
         extra={'phase':'FINAL','input_sheet': used_sheet or '', 'main_id': main_id, 'config_file': Path(args.config).name}
@@ -660,7 +710,8 @@ def main():
         return
 
     # Fase inicial
-    if main_id=='': main_id = detect_main_id(df)
+    if not main_id:
+        main_id = detect_main_id(df)
     tmp_cfg = pd.DataFrame([{ 'columna': c, 'tipo': infer_kind(df[c]), 'min_propuesto':'', 'max_propuesto':'', 'dominio':'', 'regex':'', 'prioridad':'MEDIUM', 'activo':'SI', 'resaltar_null':'SI' } for c in df.columns])
     sev_df, _, _ = build_severity_simple(df, tmp_cfg, coverage_target=args.coverage, future_days=args.future_days, main_id_col=main_id)
     ts = datetime.now().strftime('%Y%m%d_%H%M')
@@ -670,7 +721,10 @@ def main():
     print(f"Initial report -> {out_xlsx}")
     cfg_out = input_path.with_name(f"config_{input_path.stem}.xlsx")
     generate_simple_config(input_path, df, cfg_out, coverage_target=args.coverage, future_days=args.future_days, used_sheet=used_sheet)
-    print(f"Config (simple) -> {cfg_out}\nEdita la hoja 'CONFIG' (una sola pestaña). En la ultima fila __CONTROL__ pon activo=SI y dominio=<columna por la que agrupar> (p.ej. Country, Landlord Name, Product Line, Contact). Ejecuta de nuevo el mismo comando y se generaran los .msg/.html.")
+    print(f"Config (simple) -> {cfg_out}\nEdita la hoja 'CONFIG':
+  - Fila Emails: activo=SI, dominio=<columna por la que agrupar (ej. Country, Landlord, Product Line, Contact)>
+  - Fila Main ID: dominio=<columna ID principal (opcional)>
+Luego ejecuta de nuevo el mismo comando para generar FINAL + emails (.msg/.html).")
 
 if __name__ == '__main__':
     main()
