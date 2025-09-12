@@ -1,50 +1,99 @@
-# ADD: helper para elegir hoja más "densa"
-def select_excel_sheet_with_most_data(xlsx_path: Path, max_rows_sample: int = 5000) -> str:
-    xl = pd.ExcelFile(xlsx_path)
-    best_sheet, best_score = None, -1
-    for sheet in xl.sheet_names:
-        try:
-            # muestreo para rendimiento
-            df_tmp = xl.parse(sheet, nrows=max_rows_sample)
-            # puntuación = celdas no nulas totales
-            score = int(df_tmp.notna().sum().sum())
-            if score > best_score:
-                best_score, best_sheet = score, sheet
-        except Exception:
-            continue
-    return best_sheet or xl.sheet_names[0]
+# --- Add right below imports ---
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
-def smart_read_any(path: Path, forced_encoding: Optional[str] = None, forced_sep: Optional[str] = None,
-                   input_sheet: Optional[str] = None) -> Tuple[pd.DataFrame, dict]:
-    suffix = path.suffix.lower()
-    if suffix in {".xlsx", ".xls"}:
-        # Usa la hoja forzada, o selecciona la de mayor densidad
-        sheet = input_sheet or select_excel_sheet_with_most_data(path)
-        df = pd.read_excel(path, sheet_name=sheet)
-        return df, {"encoding": "binary", "sep": f"excel:{sheet}", "forced": False, "sheet": sheet}
-    return smart_read_csv_with_guess(path, forced_encoding, forced_sep)
+def apply_config_validations(writer, cfg_df, df_columns):
+    """
+    Adds Data Validation to the CONFIG sheet:
+      - Drop-down for per-column `type`, `priority`, `active`, `resaltar_null`, `include_null_in_email`
+      - Drop-down for Emails.active
+      - Drop-down for Emails.domain using dataset's column names
+    Creates a hidden 'LISTS' sheet with allowed values and dataset headers.
+    """
+    wb = writer.book
+    ws_cfg = writer.sheets["CONFIG"]
 
+    # Create LISTS sheet (or clear if exists)
+    ws_lists = wb.create_sheet("LISTS")
+    ws_lists.sheet_state = "hidden"
 
+    # Static lists
+    types = ["numeric","percent","date","email","url","categorical","free_text","id"]
+    priorities = ["LOW","MEDIUM","HIGH","VERY_HIGH"]
+    yesno = ["YES","NO"]
 
-"""
-Universal CSV/Excel Analyzer (V0.3)
------------------------------------
-- File picker (Tkinter) if --input is not provided (CSV/TSV/Excel).
-- Robust CSV reading (encoding & separator detection).
-- Excel with multiple sheets: picks the sheet with MOST non-null values (or --input-sheet override).
-- Type inference per column: numeric, percent, date, email, url, id_like, categorical, free_text.
-- Checks: missing (toggleable), duplicates (detection), outliers (IQR), magnitude outliers,
-          percent range, date bounds, categorical coherence, free text anomalies.
-- Criticality mapping (LOW, MEDIUM, HIGH, VERY_HIGH). "missing" is MEDIUM by default (toggleable).
-- Excel output: Summary, Inferred_Types, Missing, Issues, Duplicates, Dataset (colored by severity),
-                Main_ID (proposed), ID_Candidates.
-- Phase 1 (no --config and no config_* found): produces initial_report_* + config_*.xlsx (Rules/Suggested/Meta).
-- Phase 2 (--config provided OR config_* auto-detected): applies overrides & suggestions, produces final_report_*
-  and optionally emails per group (Meta.group_col) or per contact (Meta.contact_col). Emails saved as .msg or sent via Outlook.
+    # Write lists vertically
+    for i, v in enumerate(types, 1): ws_lists.cell(row=i, column=1, value=v)  # A
+    for i, v in enumerate(priorities, 1): ws_lists.cell(row=i, column=2, value=v)  # B
+    for i, v in enumerate(yesno, 1): ws_lists.cell(row=i, column=3, value=v)  # C
 
-Usage:
-  # Phase 1 (create initial report + config)
-  python csv_universal_analyzer.py -i data.xlsx
+    # Dataset column names → for Emails.domain pick-list
+    for i, v in enumerate(df_columns, 1): ws_lists.cell(row=i, column=4, value=str(v))  # D
 
-  # Phase 2 (read config, generate final + emails if enabled in config)
- 
+    # Find column indices by header name in CONFIG
+    headers = [str(c).strip().lower() for c in cfg_df.columns]
+    def col_idx(name):
+        return headers.index(name) + 1  # 1-based
+
+    n_rows = len(cfg_df) + 1  # +1 for header row already on Excel
+
+    # Build DV objects (list validation referencing LISTS)
+    dv_type = DataValidation(type="list", formula1="=LISTS!$A$1:$A$8", allow_blank=True)
+    dv_priority = DataValidation(type="list", formula1="=LISTS!$B$1:$B$4", allow_blank=True)
+    dv_yesno = DataValidation(type="list", formula1="=LISTS!$C$1:$C$2", allow_blank=True)
+    dv_headers = DataValidation(type="list", formula1="=LISTS!$D$1:$D$%d" % len(df_columns), allow_blank=True)
+
+    # Add DVs to sheet
+    ws_cfg.add_data_validation(dv_type)
+    ws_cfg.add_data_validation(dv_priority)
+    ws_cfg.add_data_validation(dv_yesno)
+    ws_cfg.add_data_validation(dv_headers)
+
+    # Apply to ranges:
+    # Per-column area: rows 2..n_rows (row 1 is header)
+    def rng(col_name, dv_obj):
+        c = col_idx(col_name)
+        col_letter = get_column_letter(c)
+        dv_obj.add(f"{col_letter}2:{col_letter}{n_rows}")
+
+    # Core per-column fields
+    # Ensure your cfg_df includes 'include_null_in_email' (default 'NO') when you move to V0.5
+    rng("tipo", dv_type)
+    rng("prioridad", dv_priority)
+    rng("activo", dv_yesno)
+    rng("resaltar_null", dv_yesno)
+    # If you already have the new column (V0.5):
+    if "include_null_in_email" in headers:
+        rng("include_null_in_email", dv_yesno)
+
+    # Now special handling for the Emails row:
+    # Find the Emails row in cfg_df and apply DV to its cells only
+    # (Excel rows = DataFrame index + 2)
+    import pandas as _pd
+    mask_emails = _pd.Series([str(x).strip().lower() for x in cfg_df["columna"]]).eq("emails")
+    if mask_emails.any():
+        emails_df_idx = cfg_df.index[mask_emails][0]
+        emails_excel_row = emails_df_idx + 2
+
+        # Emails.active drop-down
+        c_active = col_idx("activo"); col_letter = get_column_letter(c_active)
+        dv_yesno.add(f"{col_letter}{emails_excel_row}")
+
+        # Emails.domain drop-down (dataset headers)
+        c_domain = col_idx("dominio"); col_letter = get_column_letter(c_domain)
+        dv_headers.add(f"{col_letter}{emails_excel_row}")
+
+        # (V0.5) If you add email_severity_threshold and email_summary columns:
+        #   - threshold: use priorities or a short list (HIGH, VERY_HIGH)
+        #   - summary: yes/no
+        if "email_severity_threshold" in headers:
+            dv_thr = DataValidation(type="list", formula1='"HIGH,VERY_HIGH"', allow_blank=True)
+            wb.active.add_data_validation(dv_thr)
+            c_thr = col_idx("email_severity_threshold")
+            col_letter = get_column_letter(c_thr)
+            dv_thr.add(f"{col_letter}{emails_excel_row}")
+
+        if "email_summary" in headers:
+            c_sum = col_idx("email_summary")
+            col_letter = get_column_letter(c_sum)
+            dv_yesno.add(f"{col_letter}{emails_excel_row}")
