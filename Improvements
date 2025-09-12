@@ -23,3 +23,28 @@ def smart_read_any(path: Path, forced_encoding: Optional[str] = None, forced_sep
         df = pd.read_excel(path, sheet_name=sheet)
         return df, {"encoding": "binary", "sep": f"excel:{sheet}", "forced": False, "sheet": sheet}
     return smart_read_csv_with_guess(path, forced_encoding, forced_sep)
+
+
+
+"""
+Universal CSV/Excel Analyzer (V0.3)
+-----------------------------------
+- File picker (Tkinter) if --input is not provided (CSV/TSV/Excel).
+- Robust CSV reading (encoding & separator detection).
+- Excel with multiple sheets: picks the sheet with MOST non-null values (or --input-sheet override).
+- Type inference per column: numeric, percent, date, email, url, id_like, categorical, free_text.
+- Checks: missing (toggleable), duplicates (detection), outliers (IQR), magnitude outliers,
+          percent range, date bounds, categorical coherence, free text anomalies.
+- Criticality mapping (LOW, MEDIUM, HIGH, VERY_HIGH). "missing" is MEDIUM by default (toggleable).
+- Excel output: Summary, Inferred_Types, Missing, Issues, Duplicates, Dataset (colored by severity),
+                Main_ID (proposed), ID_Candidates.
+- Phase 1 (no --config and no config_* found): produces initial_report_* + config_*.xlsx (Rules/Suggested/Meta).
+- Phase 2 (--config provided OR config_* auto-detected): applies overrides & suggestions, produces final_report_*
+  and optionally emails per group (Meta.group_col) or per contact (Meta.contact_col). Emails saved as .msg or sent via Outlook.
+
+Usage:
+  # Phase 1 (create initial report + config)
+  python csv_universal_analyzer.py -i data.xlsx
+
+  # Phase 2 (read config, generate final + emails if enabled in config)
+ 
