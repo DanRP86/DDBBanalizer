@@ -1,0 +1,8 @@
+pandas>=2.0
+numpy>=1.23
+openpyxl>=3.1
+chardet>=5.0
+# Optional for .xls legacy files
+# xlrd==1.2.0
+# Windows only, for .msg generation with Outlook
+pywin32; platform_system == "Windows"
